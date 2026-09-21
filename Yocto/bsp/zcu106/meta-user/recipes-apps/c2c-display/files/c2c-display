@@ -1,0 +1,694 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-display - show the two remote camera streams on the DisplayPort monitor
+# attached to the ZCU106.
+#
+#   /dev/videoN (RGB24 in PS DDR) --> v_mix layer --> PS DisplayPort --> monitor
+#
+# The frames are already in DDR: the camera pipelines on the AUBoard write them
+# there over the Chip2Chip link. The video mixer in the ZCU106 PL reads them back
+# out and feeds the DisplayPort live video input. Every stage is packed RGB, so
+# nothing converts pixels: the capture format (V4L2 RGB24 = fourcc RGB3) and the
+# mixer layer format (DRM BGR888 = "BG24", GStreamer "RGB") are the same bytes.
+#
+# Commands:
+#   c2c-display both       both cameras side by side, 960x540 each (default)
+#   c2c-display cam0       CAM0 only, full screen
+#   c2c-display cam2       CAM2 only, full screen
+#   c2c-display pattern    modetest colour bars only - no cameras, no link needed
+#   c2c-display check      read-only diagnostics (see docs/source/display.md)
+#   c2c-display off        stop the display and blank the screen (alias: stop)
+#   c2c-display start      what c2c-display.service runs: does nothing unless
+#                          C2C_DISPLAY_ENABLE=1 in /etc/default/c2c-display
+#
+# Options:
+#   -w W  -H H   size of ONE camera window (default 960x540 for "both",
+#                1920x1080 for a single camera)
+#   -d DEV       show only this capture device, full screen
+#   -r FPS       frame rate to request (default 30)
+#   -n           print the GStreamer command instead of running it
+#   -k           do not touch the scaler; fail if the capture size already
+#                differs from the window size
+#   -f           (check) read the mixer registers even if pl_clk1 cannot be
+#                confirmed running - see the warning at mixer_clock_running()
+#   --help       this text
+#
+# RELATIONSHIP WITH c2c-cameras
+#   c2c-cameras.service owns the cameras: it waits for the link, applies the
+#   overlay and configures both pipelines, by default at the full 1920x1080. It
+#   runs at boot and this tool does not duplicate any of it - run c2c-display
+#   only once "c2c-cameras status" says the cameras are ready.
+#   The mixer layers cannot downscale, so a 960x540 window needs the picture to
+#   leave the AUBoard at 960x540. c2c-display therefore re-runs c2c-init-cams
+#   for the size it needs and re-applies C2C_CAM_CTRLS from
+#   /etc/default/c2c-cameras afterwards (c2c-init-cams resets the gain controls
+#   but knows nothing about the gamma defaults the service applies). Use -k to
+#   forbid that and be told to fix the size yourself.
+#   "c2c-display off" leaves the cameras configured and streaming-capable; it
+#   only stops GStreamer and blanks the screen. To put the cameras back to the
+#   service's own size afterwards: systemctl restart c2c-cameras.
+#
+# POSIX sh; needs modetest (libdrm-tests), gst-launch-1.0 with the v4l2 and kms
+# plugins, c2c-tools for the register readback of "check", and c2c-cameras for
+# c2c-init-cams.
+#
+# STATUS: run on hardware (ZCU106 + Dell U2417H + two cameras on an AUBoard 15P).
+# Both cameras at 960x540 side by side, and each full screen; 30.01 fps per
+# camera with no dropped frame, ~17 % CPU, 12-minute soak clean. See
+# docs/source/display.md.
+
+set -e
+
+# c2c_rd32 / c2c_is_num / c2c_need_root, shared with the other c2c-* tools. It
+# wraps whichever of devmem2 / devmem is installed and parses either output.
+. /usr/share/c2c-tools/c2c-functions.sh
+
+# Configuration. /etc/default/c2c-cameras is the camera service's file and is
+# read (never written) for the sensor mode and the picture controls, so that a
+# rescale here keeps whatever the service was told to use.
+DEFAULTS=/etc/default/c2c-display
+CAM_DEFAULTS=/etc/default/c2c-cameras
+# shellcheck disable=SC1090
+[ -r "$CAM_DEFAULTS" ] && . "$CAM_DEFAULTS"
+# shellcheck disable=SC1090
+[ -r "$DEFAULTS" ] && . "$DEFAULTS"
+
+SRC_W=${C2C_CAM_WIDTH:-1920}
+SRC_H=${C2C_CAM_HEIGHT:-1080}
+CTRLS=${C2C_CAM_CTRLS-}
+
+WIN_W=${C2C_DISPLAY_WIN_W:-960}
+WIN_H=${C2C_DISPLAY_WIN_H:-540}
+FPS=${C2C_DISPLAY_FPS:-30}
+MODE=${C2C_DISPLAY_MODE:-both}
+ENABLED=${C2C_DISPLAY_ENABLE:-0}
+ONLY_DEV=
+ONLY_CAM=
+WIN_SET=0
+DRY_RUN=0
+FORCE=0
+NO_RESCALE=0
+OUT_W=1920
+OUT_H=1080
+REFRESH=60
+
+# The mixer layer format. DRM "BG24" = DRM_FORMAT_BGR888 = three bytes per pixel
+# in R,G,B order = V4L2_PIX_FMT_RGB24 = GStreamer "RGB". Do not "fix" the
+# apparent mismatch of the names: BGR888 counts its components from the most
+# significant end of a little-endian 24-bit word, RGB24 counts bytes in memory.
+DRM_FMT=BG24
+GST_FMT=RGB
+V4L2_FMT=RGB3
+
+die() {
+	echo "${0##*/}: $*" >&2
+	exit 1
+}
+
+need() {
+	command -v "$1" >/dev/null 2>&1 || die "$1 not found (install $2)"
+}
+
+##############################################################################
+# Discovery
+##############################################################################
+
+# The platform device name carries the register base: "a2000000.v_mix".
+find_mixer() {
+	for d in /sys/bus/platform/devices/*.v_mix; do
+		[ -e "$d" ] || continue
+		basename "$d"
+		return 0
+	done
+	return 1
+}
+
+# modetest dump of the mixer's DRM card, fetched once and reused.
+#
+# BOTH -c and -p are needed. modetest prints only the sections it was asked
+# for: with -p alone there is no "Connectors:" section at all, and every
+# connector lookup then silently finds nothing ("no connected DisplayPort
+# connector" on a board whose monitor is plugged in and working). The order is
+# fixed by modetest itself - connectors, then CRTCs, then planes - which is what
+# the section-delimited awk parsers below rely on.
+mt_dump() {
+	modetest -M xlnx -D "$MIXER" -c -p 2>/dev/null
+}
+
+# First connector whose status field is exactly "connected".
+# Row: <id> <encoder> <status> <name> <size> <modes> <encoders>
+# The exact match matters: "disconnected" contains "connected".
+mt_connector() {
+	awk '/^Connectors:/{f=1;next} /^CRTCs:/{f=0}
+	     f && $3=="connected" {print $1; exit}' "$1"
+}
+
+mt_crtc() {
+	awk '/^CRTCs:/{f=1;next} /^Planes:/{f=0}
+	     f && $1 ~ /^[0-9]+$/ {print $1; exit}' "$1"
+}
+
+# One line per plane: "<id> <type> <formats...>", type 0=Overlay 1=Primary
+# 2=Cursor. The mixer gives each plane exactly one format, taken from that
+# layer's xlnx,vformat, so the overlay planes are the camera layers.
+mt_planes() {
+	awk '
+	  /^Planes:/      {inp=1; next}
+	  /^Frame buffers:/ {inp=0}
+	  inp && $1 ~ /^[0-9]+$/ && NF>=7 {
+	      if (id != "") print id, type, fmts
+	      id=$1; type="?"; fmts=""; want=0; next }
+	  inp && /formats:/ { sub(/^[ \t]*formats:[ \t]*/,""); fmts=$0; next }
+	  inp && /[0-9]+ type:/ { want=1; next }
+	  inp && want && /value:/ { type=$2; want=0; next }
+	  END { if (id != "") print id, type, fmts }
+	' "$1"
+}
+
+# Capture devices of the remote pipelines.
+#
+# The glob is /dev/video[0-9]* and NOT /dev/video*, because 99-c2c-cameras.rules
+# adds /dev/video-cam0 and /dev/video-cam2 as symlinks to these same nodes -
+# /dev/video* would find each camera twice. Where such a symlink exists it is
+# what gets printed and used, so the command this tool echoes stays valid across
+# a reboot (the videoN numbering does not).
+find_cameras() {
+	for v in /dev/video[0-9]*; do
+		[ -e "$v" ] || continue
+		v4l2-ctl -d "$v" --get-fmt-video 2>/dev/null |
+			grep -q "'$V4L2_FMT'" || continue
+		_n=$(cam_index "$v" 2>/dev/null)
+		if [ -n "$_n" ] && [ -e "/dev/video-cam$_n" ]; then
+			echo "/dev/video-cam$_n"
+		else
+			echo "$v"
+		fi
+	done
+}
+
+# Width and height currently set on a capture device.
+cam_size() {
+	v4l2-ctl -d "$1" --get-fmt-video 2>/dev/null |
+		sed -n 's/.*Width\/Height *: *\([0-9]*\)\/\([0-9]*\).*/\1 \2/p' |
+		sed -n '1p'
+}
+
+# cam_index DEV - the RPi Camera FMC port (0 or 2) behind a capture device.
+# The capture entity is named vcap_mipi_<N>_v_proc, so the number comes from the
+# media topology rather than from the /dev/videoN numbering, which is probe
+# order and not stable. A /dev/video-camN name (from 99-c2c-cameras.rules) says
+# it outright; anything else is resolved to its real node first, because the
+# topology prints /dev/videoN and never the symlink.
+cam_index() {
+	case "${1##*/}" in
+	video-cam[0-9])
+		printf '%s\n' "${1##*video-cam}"
+		return 0
+		;;
+	esac
+	_r=$(readlink -f "$1" 2>/dev/null) || _r=$1
+	[ -n "$_r" ] || _r=$1
+	for m in /dev/media[0-9]*; do
+		[ -e "$m" ] || continue
+		_t=$(media-ctl -d "$m" -p 2>/dev/null) || continue
+		printf '%s\n' "$_t" | grep -qF "$_r" || continue
+		printf '%s\n' "$_t" | sed -n 's/.*vcap_mipi_\([0-9]\)_v_proc.*/\1/p' | sed -n '1p'
+		return 0
+	done
+	return 1
+}
+
+# dev_for_cam N - the capture device of RPi Camera FMC port N.
+dev_for_cam() {
+	# The udev name when it is there: no media graph walk needed at all.
+	if [ -e "/dev/video-cam$1" ]; then
+		echo "/dev/video-cam$1"
+		return 0
+	fi
+	for v in $(find_cameras); do
+		[ "$(cam_index "$v")" = "$1" ] && { echo "$v"; return 0; }
+	done
+	return 1
+}
+
+# ensure_capture_size W H DEV... - make every listed capture device produce
+# exactly WxH.
+#
+# The video mixer's layers can only upscale, so the picture has to leave the
+# AUBoard at the window size; the scaler that does it is the remote v_proc_ss,
+# driven by c2c-init-cams. c2c-cameras.service configured these pipelines at
+# boot (1920x1080 by default), so this is a deliberate, announced change to what
+# the service set up - and c2c-init-cams reconfigures BOTH pipelines, which is
+# why the size is applied once for all of them rather than per device.
+#
+# c2c-init-cams resets analogue_gain / digital_gain and knows nothing about the
+# gamma defaults c2c-cameras applies afterwards, so those are re-applied here.
+ensure_capture_size() {
+	_w=$1; _h=$2; shift 2
+	# Keep the device list in a variable: the size comparison below uses
+	# "set --" to split cam_size's two numbers, which OVERWRITES "$@". Iterating
+	# over "$@" afterwards then walked over "1920" and "1080" instead of the
+	# capture devices, so the picture controls were silently never re-applied
+	# and every rescaled stream came out with the driver's linear gamma
+	# (measured: washed-out, over-bright windows). Device paths have no spaces.
+	_devs=$*
+	_need=0
+	for _v in $_devs; do
+		set -- $(cam_size "$_v")
+		[ "$1" = "$_w" ] && [ "$2" = "$_h" ] || _need=1
+	done
+	[ "$_need" = 0 ] && return 0
+
+	if [ "$NO_RESCALE" = 1 ]; then
+		die "the cameras do not produce ${_w}x${_h} and -k forbids changing them.
+Run:  c2c-init-cams $SRC_W $SRC_H $_w $_h"
+	fi
+	command -v c2c-init-cams >/dev/null 2>&1 ||
+		die "c2c-init-cams not found (it comes with c2c-cameras) - cannot set the capture size to ${_w}x${_h}"
+
+	echo "Rescaling the remote pipelines: sensor ${SRC_W}x${SRC_H} -> ${_w}x${_h}"
+	echo "  (the mixer cannot downscale, so the AUBoard scaler does it)"
+	c2c-init-cams "$SRC_W" "$SRC_H" "$_w" "$_h" >/dev/null 2>&1 ||
+		die "c2c-init-cams failed - are the cameras ready? (c2c-cameras status)"
+
+	# Restore the picture controls the camera service applies at boot.
+	if [ -n "$CTRLS" ]; then
+		for _v in $_devs; do
+			v4l2-ctl -d "$_v" --set-ctrl="$CTRLS" >/dev/null 2>&1 ||
+				echo "warning: could not re-apply '$CTRLS' on $_v" >&2
+		done
+	fi
+}
+
+##############################################################################
+# check - read-only diagnostics
+##############################################################################
+
+# peek ADDR LABEL - one 32-bit register through /dev/mem. These are local PL
+# registers, well clear of the Chip2Chip window, so no link check is needed:
+# they answer whether or not the remote board is alive.
+peek() {
+	v=$(c2c_rd32 "$1" 2>/dev/null) || v=
+	printf '  %-12s %-12s %s\n' "$1" "${v:-<read failed>}" "$2"
+}
+
+# The video mixer is an HLS core: its AXI4-Lite port runs in the 250 MHz pl_clk1
+# domain, and the control interconnect crosses into it. If pl_clk1 is stopped, a
+# read of a mixer register NEVER COMPLETES and hangs the CPU that issued it -
+# the same failure mode as touching the Chip2Chip window with the link down.
+# system-user.dtsi pins pl_clk1 on with an "xlnx,fclk" node, but check before
+# peeking rather than trusting it. The timing controller and the clock wizard
+# are in the pl_clk0 domain and are always safe.
+#
+# Returns 0 = safe to read, 1 = cannot confirm.
+mixer_clock_running() {
+	for c in /sys/kernel/debug/clk/pl1_ref /sys/kernel/debug/clk/*pl1_ref*; do
+		[ -r "$c/clk_enable_count" ] || continue
+		[ "$(cat "$c/clk_enable_count" 2>/dev/null || echo 0)" -gt 0 ] && return 0
+		return 1
+	done
+	# No debugfs. A bound mixer driver means the clock was claimed at probe.
+	for n in /sys/bus/platform/drivers/xlnx-mixer/*.v_mix; do
+		[ -e "$n" ] && return 0
+	done
+	return 1
+}
+
+do_check() {
+	MIXER=$(find_mixer) || die "no *.v_mix platform device: is the bitstream loaded and the mixer probed? (dmesg | grep -i mixer)"
+	BASE=0x${MIXER%%.*}
+
+	echo "=== video mixer ==========================================="
+	echo "platform device : $MIXER   (registers at $BASE)"
+	for n in /sys/bus/platform/drivers/xlnx-mixer/*.v_mix; do
+		[ -e "$n" ] && echo "driver bound    : yes (xlnx-mixer)" && break
+	done
+
+	echo
+	echo "=== kernel command line ==================================="
+	if grep -q 'xlnx_mixer.connect_drm_bridge=1' /proc/cmdline; then
+		echo "connect_drm_bridge=1 : present"
+	else
+		echo "connect_drm_bridge=1 : MISSING - the mixer will have no DRM"
+		echo "                       connector and the monitor will stay dark."
+	fi
+	sed -n 's/^/  /p' /proc/cmdline
+
+	echo
+	echo "=== DRM connector / CRTC / planes =========================="
+	if ! command -v modetest >/dev/null 2>&1; then
+		echo "modetest not installed (libdrm-tests) - skipping"
+	else
+		TMP=$(mktemp) || die "mktemp failed"
+		trap 'rm -f "$TMP"' EXIT
+		mt_dump > "$TMP"
+		conn=$(mt_connector "$TMP")
+		crtc=$(mt_crtc "$TMP")
+		echo "connected connector : ${conn:-NONE}"
+		echo "crtc                : ${crtc:-NONE}"
+		if [ -z "$conn" ]; then
+			echo "  No connected connector. Either the monitor/cable is not there,"
+			echo "  or the DisplayPort bridge did not attach (check dmesg for"
+			echo "  'zynqmp-dpsub' and 'xlnx-mixer' probe errors)."
+		fi
+		echo "planes (id type formats), type 1 = primary, 0 = overlay:"
+		mt_planes "$TMP" | sed -n 's/^/  /p'
+		echo "modes offered by the connector (first 8):"
+		awk -v c="$conn" '$1==c{f=1;next} f&&/^$/{exit} f' "$TMP" |
+			sed -n '1,8s/^/  /p'
+	fi
+
+	echo
+	echo "=== connector status / EDID (sysfs) ======================="
+	for c in /sys/class/drm/card*-DP-*; do
+		[ -e "$c" ] || continue
+		echo "$(basename "$c") : status=$(cat "$c/status" 2>/dev/null)  enabled=$(cat "$c/enabled" 2>/dev/null)"
+		# The EDID must be SIZED BY READING IT. It is a sysfs binary attribute
+		# declared with .size = 0, so stat() reports 0 bytes however much data
+		# it returns and "[ -s edid ]" is false on a perfectly good monitor.
+		_n=$(wc -c < "$c/edid" 2>/dev/null) || _n=0
+		if [ "${_n:-0}" -gt 0 ]; then
+			echo "  EDID present ($_n bytes) - the monitor answered on AUX"
+		else
+			echo "  EDID EMPTY - no monitor replied on the AUX channel"
+		fi
+	done
+
+	echo
+	echo "=== video mixer registers ================================="
+	if ! mixer_clock_running && [ "$FORCE" != 1 ]; then
+		echo "SKIPPED: cannot confirm that pl_clk1 (the mixer's 250 MHz clock) is"
+		echo "running. Reading a mixer register with that clock stopped never"
+		echo "completes and hangs the CPU. Check the fclk1 node in the device tree"
+		echo "and 'cat /sys/kernel/debug/clk/pl1_ref/clk_enable_count' (mount"
+		echo "debugfs first), or re-run with -f once you are sure."
+	elif command -v devmem2 >/dev/null 2>&1 || command -v devmem >/dev/null 2>&1; then
+		# HLS control: bit0 ap_start, bit1 ap_done, bit2 ap_idle, bit7 auto-restart.
+		# A running mixer reads back with auto-restart set and is NOT idle.
+		peek "$(printf '0x%x' $((BASE + 0x00)))" "AP_CTRL  (bit7 auto-restart, bit2 idle)"
+		peek "$(printf '0x%x' $((BASE + 0x10)))" "active WIDTH   (expect $OUT_W)"
+		peek "$(printf '0x%x' $((BASE + 0x18)))" "active HEIGHT  (expect $OUT_H)"
+		peek "$(printf '0x%x' $((BASE + 0x40)))" "LAYERENABLE (bit N = layer N on)"
+		# Per-layer block: layer N starts at 0x100*(N+1); buffer address at +0x40.
+		for L in 1 2; do
+			o=$((0x100 * (L + 1)))
+			echo "  -- layer $L --"
+			peek "$(printf '0x%x' $((BASE + o + 0x08)))" "layer$L START X"
+			peek "$(printf '0x%x' $((BASE + o + 0x10)))" "layer$L START Y"
+			peek "$(printf '0x%x' $((BASE + o + 0x18)))" "layer$L WIDTH"
+			peek "$(printf '0x%x' $((BASE + o + 0x20)))" "layer$L STRIDE (expect width*3)"
+			peek "$(printf '0x%x' $((BASE + o + 0x28)))" "layer$L HEIGHT"
+			peek "$(printf '0x%x' $((BASE + o + 0x40)))" "layer$L BUFFER ADDR (must be < 0x80000000)"
+		done
+	else
+		echo "neither devmem2 nor devmem is installed - skipping"
+	fi
+
+	echo
+	echo "=== timing controller (v_tc) =============================="
+	# The generated device-tree node is named "v_tc_0@a2010000", NOT "v_tc@...",
+	# so the platform device is "a2010000.v_tc_0". Match both spellings.
+	for d in /sys/bus/platform/devices/*.v_tc /sys/bus/platform/devices/*.v_tc_*; do
+		[ -e "$d" ] || continue
+		vtc=$(basename "$d"); vbase=0x${vtc%%.*}
+		echo "platform device : $vtc"
+		if command -v devmem2 >/dev/null 2>&1 || command -v devmem >/dev/null 2>&1; then
+			# CTL bit0 = generator enable; GASIZE = active size, height<<16 | width.
+			peek "$(printf '0x%x' $((vbase + 0x000)))" "VTC CTL   (bit0 = generator enabled)"
+			peek "$(printf '0x%x' $((vbase + 0x060)))" "VTC GASIZE (height<<16 | width)"
+		fi
+	done
+
+	echo
+	echo "=== pixel clock ==========================================="
+	for c in /sys/kernel/debug/clk/*clk_out1* /sys/kernel/debug/clk/*clk_wiz*; do
+		[ -e "$c/clk_rate" ] || continue
+		echo "$(basename "$c") : $(cat "$c/clk_rate") Hz  (1080p60 wants 148500000)"
+	done
+	[ -e /sys/kernel/debug/clk ] || echo "debugfs not mounted - mount -t debugfs none /sys/kernel/debug"
+
+	echo
+	echo "=== cameras (owned by c2c-cameras.service) ================"
+	if command -v c2c-cameras >/dev/null 2>&1; then
+		c2c-cameras status 2>/dev/null | sed -n 's/^/  /p'
+	fi
+	cams=$(find_cameras)
+	for v in $cams; do
+		set -- $(cam_size "$v")
+		echo "  $v = CAM$(cam_index "$v" 2>/dev/null || echo '?') : ${1}x${2} $V4L2_FMT"
+	done
+	if [ -z "$cams" ]; then
+		echo "  no $V4L2_FMT capture device - the cameras are not up."
+		echo "  They are brought up at boot by c2c-cameras.service; retry with"
+		echo "  'systemctl start c2c-cameras' once the AUBoard is running."
+	else
+		echo "  Window size for 'both' is ${WIN_W}x${WIN_H}; c2c-display re-runs"
+		echo "  c2c-init-cams if the capture size differs (the mixer cannot downscale)."
+	fi
+	echo
+	echo "=== display service ======================================="
+	echo "  enabled in $DEFAULTS : C2C_DISPLAY_ENABLE=$ENABLED (0 = display idle at boot)"
+	if command -v systemctl >/dev/null 2>&1; then
+		# is-enabled/is-active print the answer AND exit non-zero for
+		# "disabled"/"inactive", so a "|| echo unknown" fallback appends a
+		# second line to a perfectly good answer. Take the first line and
+		# only substitute when nothing was printed.
+		_en=$(systemctl is-enabled c2c-display.service 2>/dev/null | sed -n 1p)
+		_ac=$(systemctl is-active c2c-display.service 2>/dev/null | sed -n 1p)
+		echo "  unit state : ${_en:-unknown} / ${_ac:-unknown}"
+	fi
+
+	echo
+	echo "=== recent DRM / display kernel messages =================="
+	dmesg 2>/dev/null | grep -iE 'drm|dpsub|mixer|v_tc|psgtr|displayport' | tail -20 |
+		sed -n 's/^/  /p'
+}
+
+##############################################################################
+# Mode setting
+##############################################################################
+
+# set_mode - put the CRTC into 1920x1080@60 so the DisplayPort link comes up.
+# The primary plane's own format is used for the modetest framebuffer; the
+# camera windows go on the overlay planes afterwards.
+set_mode() {
+	prim_fmt=$(mt_planes "$1" | awk '$2==1 {print $3; exit}')
+	[ -n "$prim_fmt" ] || prim_fmt=$DRM_FMT
+	prim_fmt=${prim_fmt%% *}
+	echo "Setting mode ${OUT_W}x${OUT_H}-${REFRESH} on connector $CONN, crtc $CRTC (primary format $prim_fmt)"
+	# The refresh rate is pinned: the monitor may prefer a mode the PL pixel
+	# clock cannot make, and the DisplayPort then drives no valid pixels at all.
+	# The piped echo makes modetest return instead of waiting for Enter; the
+	# mode stays programmed afterwards.
+	echo | modetest -M xlnx -D "$MIXER" -s "${CONN}@${CRTC}:${OUT_W}x${OUT_H}-${REFRESH}@${prim_fmt}" ||
+		die "modetest could not set the mode - see 'c2c-display check'"
+	set_background
+}
+
+# set_background - make the area around the camera windows black.
+# The mixer fills whatever no layer covers with its background colour. The
+# driver programs its default (blue) at every mode set and this kernel does
+# not expose the colour as a DRM property, so write the three background
+# registers (Y_R 0x28, U_G 0x30, V_B 0x38) directly, after the mode set. They
+# are in the pl_clk1 domain: only touch them when that clock is known to run.
+set_background() {
+	base="0x${MIXER%%.*}"
+	c2c_is_num "$base" || return 0
+	if ! mixer_clock_running; then
+		echo "note: cannot confirm pl_clk1 is running - leaving the mixer background colour alone"
+		return 0
+	fi
+	for off in 0x28 0x30 0x38; do
+		c2c_wr32 $((base + off)) 0 >/dev/null 2>&1 ||
+			{ echo "note: could not set the mixer background colour"; return 0; }
+	done
+}
+
+##############################################################################
+# Commands
+##############################################################################
+
+do_pattern() {
+	need modetest libdrm-tests
+	MIXER=$(find_mixer) || die "no *.v_mix platform device"
+	TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+	mt_dump > "$TMP"
+	CONN=$(mt_connector "$TMP")
+	CRTC=$(mt_crtc "$TMP")
+	[ -n "$CONN" ] || die "no connected DisplayPort connector - run 'c2c-display check'"
+	[ -n "$CRTC" ] || die "the mixer registered no CRTC - run 'c2c-display check'"
+	set_mode "$TMP"
+	echo
+	echo "The monitor should now show the modetest colour pattern."
+	echo "Nothing about the Chip2Chip link or the cameras is involved in this test:"
+	echo "if this works, the mixer, the pixel clock and the DisplayPort are all good."
+}
+
+do_off() {
+	MIXER=$(find_mixer) || die "no *.v_mix platform device"
+	pkill -f 'gst-launch-1.0.*kmssink' 2>/dev/null || true
+	echo | modetest -M xlnx -D "$MIXER" -s "0@0:" >/dev/null 2>&1 || true
+	echo "display stopped"
+}
+
+do_start() {
+	need modetest libdrm-tests
+	need gst-launch-1.0 gstreamer1.0
+	MIXER=$(find_mixer) || die "no *.v_mix platform device"
+
+	# Before anything touches a capture device: is the remote side still the
+	# one the drivers probed? If the AUBoard was power-cycled while this Linux
+	# kept running, its video IPs are back in reset, and opening a capture
+	# device - which is what this tool does next - hangs the CPU on a read that
+	# never completes. c2c-cameras health is read-only and costs two register
+	# reads per pipeline. Exit 5 is that condition; it is passed straight on so
+	# a caller can tell it apart from "no monitor" or "no cameras".
+	if command -v c2c-cameras >/dev/null 2>&1; then
+		c2c-cameras health >/dev/null 2>&1 || _hrc=$?
+		case "${_hrc:-0}" in
+		0) ;;
+		5)
+			c2c-cameras health >&2 || :
+			exit 5
+			;;
+		*)
+			c2c-cameras health >&2 || :
+			die "the cameras are not usable (c2c-cameras health exit ${_hrc}); not starting the display"
+			;;
+		esac
+	fi
+
+	TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+	mt_dump > "$TMP"
+	CONN=$(mt_connector "$TMP")
+	CRTC=$(mt_crtc "$TMP")
+	[ -n "$CONN" ] || die "no connected DisplayPort connector - run 'c2c-display check'"
+	[ -n "$CRTC" ] || die "the mixer registered no CRTC - run 'c2c-display check'"
+
+	# Overlay planes that take our pixel format, in plane-id order.
+	PLANES=$(mt_planes "$TMP" | awk -v f="$DRM_FMT" '$2==0 && index($0,f) {print $1}')
+	[ -n "$PLANES" ] || die "the mixer has no $DRM_FMT overlay plane - is the mixer built with layer format 20 (RGB8)? run 'c2c-display check'"
+
+	# Which cameras, and how big a window each gets.
+	if [ -n "$ONLY_DEV" ]; then
+		CAMS=$ONLY_DEV
+		SINGLE=1
+	elif [ -n "$ONLY_CAM" ]; then
+		CAMS=$(dev_for_cam "$ONLY_CAM") ||
+			die "no capture device for CAM$ONLY_CAM - is it connected? (c2c-cameras status)"
+		SINGLE=1
+	else
+		CAMS=$(find_cameras)
+		SINGLE=0
+	fi
+	[ -n "$CAMS" ] || die "no $V4L2_FMT capture device: the cameras are not up. Run 'c2c-cameras status' (they are brought up at boot by c2c-cameras.service)."
+
+	# A single camera gets the whole screen unless a size was asked for.
+	if [ "$SINGLE" = 1 ] && [ "$WIN_SET" = 0 ]; then
+		WIN_W=$OUT_W
+		WIN_H=$OUT_H
+	fi
+
+	# The mixer cannot downscale, so the AUBoard scaler has to deliver the
+	# window size. This is the one place where c2c-display changes something
+	# c2c-cameras.service set up, and it says so.
+	ensure_capture_size "$WIN_W" "$WIN_H" $CAMS
+
+	set_mode "$TMP"
+
+	# "both": windows side by side, vertically centred on the 1920x1080 screen.
+	# A single camera is centred on both axes (full screen puts it at 0,0).
+	n=0
+	for v in $CAMS; do n=$((n + 1)); done
+	x=$(( (OUT_W - n * WIN_W) / 2 ))
+	[ "$x" -lt 0 ] && x=0
+	y=$(( (OUT_H - WIN_H) / 2 ))
+	[ "$y" -lt 0 ] && y=0
+
+	cmd="gst-launch-1.0"
+	planes=$PLANES
+	for v in $CAMS; do
+		plane=$(echo "$planes" | sed -n '1p')
+		[ -n "$plane" ] || die "more cameras than $DRM_FMT overlay planes (the mixer has $(echo "$PLANES" | wc -l))"
+		planes=$(echo "$planes" | sed -n '2,$p')
+		cmd="$cmd v4l2src device=$v io-mode=mmap"
+		cmd="$cmd ! video/x-raw,format=$GST_FMT,width=$WIN_W,height=$WIN_H,framerate=$FPS/1"
+		# render-rectangle needs the spaced "< x, y, w, h >" form, and can-scale
+		# must be true or the rectangle is silently ignored and the picture is
+		# drawn centred instead.
+		cmd="$cmd ! kmssink bus-id=$MIXER plane-id=$plane"
+		cmd="$cmd render-rectangle=\"< $x, $y, $WIN_W, $WIN_H >\""
+		cmd="$cmd show-preroll-frame=false sync=false can-scale=true"
+		echo " CAM$(cam_index "$v" 2>/dev/null || echo '?') $v -> plane $plane, window ${WIN_W}x${WIN_H} at ${x},${y}"
+		x=$((x + WIN_W))
+	done
+
+	echo
+	echo "GStreamer command:"
+	echo "  $cmd"
+	echo
+	[ "$DRY_RUN" = 1 ] && exit 0
+	eval "$cmd"
+}
+
+# What c2c-display.service runs. The unit is shipped DISABLED and this still
+# refuses unless the config says otherwise, so the default boot is "cameras
+# ready, display idle" even if somebody enables the unit by accident.
+do_service_start() {
+	if [ "$ENABLED" != 1 ]; then
+		echo "c2c-display is not enabled (C2C_DISPLAY_ENABLE=$ENABLED in $DEFAULTS); nothing to do"
+		exit 0
+	fi
+	case "$MODE" in
+		cam0) ONLY_CAM=0 ;;
+		cam2) ONLY_CAM=2 ;;
+		both | "") ;;
+		*) die "C2C_DISPLAY_MODE must be both, cam0 or cam2 (got '$MODE')" ;;
+	esac
+	do_start
+}
+
+##############################################################################
+
+CMD=both
+case "${1:-}" in
+	both) CMD=both; shift ;;
+	cam0) CMD=both; ONLY_CAM=0; shift ;;
+	cam2) CMD=both; ONLY_CAM=2; shift ;;
+	pattern | check) CMD=$1; shift ;;
+	# "stop" is the word most people reach for, and what the unit does.
+	off | stop) CMD=off; shift ;;
+	start) CMD=service; shift ;;
+	help | --help | -h)
+		sed -n '5,55p' "$0" | sed 's/^# \{0,1\}//'
+		exit 0
+		;;
+esac
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-w) WIN_W=$2; WIN_SET=1; shift 2 ;;
+		-H) WIN_H=$2; WIN_SET=1; shift 2 ;;
+		-d) ONLY_DEV=$2; shift 2 ;;
+		-r) FPS=$2; shift 2 ;;
+		-n) DRY_RUN=1; shift ;;
+		-k) NO_RESCALE=1; shift ;;
+		-f) FORCE=1; shift ;;
+		--help) sed -n '5,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) die "unknown option '$1' (try --help)" ;;
+	esac
+done
+
+for n in "$WIN_W" "$WIN_H" "$FPS" "$SRC_W" "$SRC_H"; do
+	c2c_is_num "$n" || die "sizes and frame rate must be numbers (got '$n')"
+done
+
+case "$CMD" in
+	check) do_check ;;
+	pattern) do_pattern ;;
+	off) do_off ;;
+	service) do_service_start ;;
+	both) do_start ;;
+esac

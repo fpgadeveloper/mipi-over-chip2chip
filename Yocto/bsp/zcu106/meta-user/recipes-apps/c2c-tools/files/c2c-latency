@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-latency [N] - rough AXI-Lite round-trip latency through the AXI Chip2Chip window:
+# N single 32-bit reads of a remote register vs the same loop on a local PL register.
+import ctypes, mmap, os, sys, time
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 1000
+LOCAL, REMOTE = 0xA1000000, 0xA0010000      # link status GPIO (ZCU106), scratch BRAM (AUBoard)
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+def reg(addr):
+    m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=addr)
+    return m, ctypes.c_uint32.from_buffer(m, 0)   # one 32-bit load per .value
+ml, rl = reg(LOCAL)
+st = rl.value
+if st & 0x9 != 0x9:
+    sys.exit("link is DOWN (status 0x%X): not touching the remote window" % st)
+mr, rr = reg(REMOTE)
+def run(r):
+    ts = []
+    for _ in range(N):
+        t0 = time.perf_counter_ns(); v = r.value; ts.append(time.perf_counter_ns() - t0)
+    ts.sort()
+    return v, sum(ts) / N / 1000.0, ts[N // 2] / 1000.0, ts[0] / 1000.0, ts[int(N * 0.99)] / 1000.0
+for name, r in (("local  0x%08X" % LOCAL, rl), ("remote 0x%08X" % REMOTE, rr)):
+    v, mean, med, mn, p99 = run(r)
+    print("%s  value 0x%08X  %d reads: mean %.1f us  median %.1f us  min %.1f us  p99 %.1f us" % (name, v, N, mean, med, mn, p99))
+print("link status after: 0x%X" % rl.value)

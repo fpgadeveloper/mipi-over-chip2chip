@@ -1,0 +1,30 @@
+RemoteSystemsTempFiles/
+Vivado/.Xil/
+Vivado/logs/
+*.log
+*.jou
+Vitis/*_workspace/
+Vitis/.*/
+Vitis/.*
+Vitis/boot/
+docs/build/
+Packages/
+bootimages/
+# per-target build locks of the build runner (.<target>.lock)
+/.*.lock
+# UPDATER START
+Vivado/zcu106/
+Vivado/auboard/
+# UPDATER END
+dfx_runtime.txt
+.repo.yaml
+.memdata_temp_mem_file.mem
+Vivado/*.bif
+Vivado/*.pdi
+Vivado/*.rcdo
+Vivado/*.rnpi
+Vivado/wdi_info.xml
+__pycache__/
+*.pyc
+Vivado/gen_files/
+Vivado/static_files/

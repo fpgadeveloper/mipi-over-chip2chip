@@ -1,0 +1,19 @@
+{
+	"bd_name": "c2c",
+	"app_name": "cam_test",
+	"app_template": "None",
+	"src": {
+		"all": "common/src",
+		"mb": "",
+		"zynq": "",
+		"zynqmp": "",
+		"versal": ""
+	},
+	"user_dtsi": "common/dts/remote_pipeline.dtsi",
+	"user_dtsi_generator": "py/user_dts.py",
+	"user_dtsi_address_map": true,
+	"pre_build_script": "py/pre_build.py",
+	"combine_bit_elf": false,
+	"stack_size": "0x10000",
+	"heap_size": "0x10000"
+}

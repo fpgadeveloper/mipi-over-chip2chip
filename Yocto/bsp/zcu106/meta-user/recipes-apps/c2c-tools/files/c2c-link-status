@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-link-status - read and decode the Aurora / AXI Chip2Chip link status of the
+# MIPI over Chip2Chip design. The status bits are inputs of an AXI GPIO in the
+# ZCU106 itself (0xA1000000), so reading them is safe whatever the link state.
+
+. /usr/share/c2c-tools/c2c-functions.sh
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} [-q] [-r] [-w SECONDS]
+  -q          quiet: print nothing, report through the exit status only
+  -r          raw: print only the value of the status register
+  -w SECONDS  wait up to SECONDS for the link to come up
+Exit status: 0 link up (channel_up and link_status both set), 1 link down,
+             2 error (not root, status register unreadable, bad usage)
+EOF
+}
+
+quiet=0
+raw=0
+wait_s=0
+while getopts qrw:h opt; do
+	case $opt in
+	q) quiet=1 ;;
+	r) raw=1 ;;
+	w)
+		case "$OPTARG" in
+		'' | *[!0-9]*) c2c_die "-w needs a number of seconds" ;;
+		esac
+		wait_s=$OPTARG
+		;;
+	h)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+
+c2c_need_root
+
+while :; do
+	c2c_link_up
+	rc=$?
+	[ "$rc" -eq 2 ] && c2c_die "cannot read the link status at $C2C_STATUS_ADDR"
+	[ "$rc" -eq 0 ] && break
+	[ "$wait_s" -gt 0 ] || break
+	wait_s=$((wait_s - 1))
+	sleep 1
+done
+
+[ "$quiet" -eq 1 ] && exit "$rc"
+if [ "$raw" -eq 1 ]; then
+	echo "$C2C_STATUS"
+	exit "$rc"
+fi
+
+# bit name expected-value-when-healthy
+bits="
+0 channel_up 1
+1 lane_up 1
+2 gt_pll_lock 1
+3 c2c_link_status 1
+4 c2c_link_error 0
+5 c2c_multi_bit_error 0
+6 c2c_config_error 0
+7 aurora_hard_err 0
+8 aurora_soft_err 0
+9 mmcm_not_locked 0
+"
+
+echo "link status @ $C2C_STATUS_ADDR = $C2C_STATUS"
+echo "$bits" | while read -r bit name good; do
+	[ -n "$bit" ] || continue
+	val=$(((C2C_STATUS >> bit) & 1))
+	flag=
+	[ "$val" -eq "$good" ] || flag="  <--"
+	printf '  [%d] %-20s %d%s\n' "$bit" "$name" "$val" "$flag"
+done
+
+if [ "$rc" -eq 0 ]; then
+	echo "link: UP"
+else
+	echo "link: DOWN"
+fi
+exit "$rc"

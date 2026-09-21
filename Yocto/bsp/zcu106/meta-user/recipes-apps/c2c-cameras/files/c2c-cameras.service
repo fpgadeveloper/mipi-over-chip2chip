@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# Automatic bring-up of the two MIPI camera pipelines that live on the AUBoard
+# 15P, behind the AXI Chip2Chip link. See /usr/bin/c2c-cameras and
+# /etc/default/c2c-cameras.
+#
+# Nothing in the system depends on this unit: no target Requires it and it is
+# ordered Before= nothing, so the console, sshd and the rest of multi-user.target
+# come up in parallel with it. A ZCU106 without the second board boots and runs
+# normally; the unit then reports why the cameras are not there.
+
+[Unit]
+Description=Remote MIPI cameras over AXI Chip2Chip
+Documentation=https://github.com/fpgadeveloper/mipi-over-chip2chip
+# The pipeline needs udev to have created /dev/video* and /dev/media*, and the
+# overlay is loaded through configfs.
+After=local-fs.target sys-kernel-config.mount systemd-udevd.service
+Wants=sys-kernel-config.mount
+ConditionPathExists=/usr/bin/c2c-link-status
+ConditionPathExists=/lib/firmware/c2c/c2c-cams.dtbo
+# Retrying by hand ("systemctl restart c2c-cameras", possibly several times
+# while the AUBoard is being brought up) must not run into systemd's default
+# start rate limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Stay "active (exited)" after a successful start: it is what makes the cameras
+# "configured" state visible in systemctl status, and - the reason it cannot be
+# dropped - it is what lets ExecStop run at shutdown, which halts the remote
+# frame buffer writers before this board's DDR is reused. With
+# RemainAfterExit=no the unit would go inactive the moment ExecStart returned
+# and ExecStop would run immediately, stopping the cameras the service had just
+# started.
+#
+# THE RETRY IS "restart", NOT "start". systemd re-runs a oneshot on "start"
+# only while the unit is NOT active, so "systemctl start c2c-cameras" is a
+# silent no-op (measured: 0.084 s, nothing in the journal) in exactly the case
+# where a retry is wanted - the AUBoard was power-cycled while this board kept
+# running. Everything the script does is idempotent (the overlay is applied at
+# most once per boot, and a second apply is skipped, not repeated), and
+# ExecStop only quiesces writers that are out of reset, so "restart" is safe in
+# every state. Every message in /usr/bin/c2c-cameras and the documentation says
+# "restart" for this reason.
+RemainAfterExit=yes
+ExecStart=/usr/bin/c2c-cameras start
+ExecStop=/usr/bin/c2c-cameras stop
+# Must exceed C2C_LINK_TIMEOUT + C2C_DEV_TIMEOUT of /etc/default/c2c-cameras.
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+
+/*
+ * Board fixups for the zcu106 host of the MIPI over Chip2Chip design, layered on
+ * top of the gen-machineconf / lopper-generated Linux device tree (which already
+ * carries the PS config and the PL hardware of the ZCU106 from the XSA). Scoped
+ * to the Linux domain by device-tree.bbappend, and #included LAST, so every
+ * property set here wins over the generated one.
+ *
+ * NOTE: the EDF device-tree recipe sets KERNEL_INCLUDE = "", so no
+ * <dt-bindings/...> header is available here. Use numeric constants.
+ *
+ * What is NOT here, on purpose: the peripherals of the AUBoard 15P, reached
+ * through the AXI Chip2Chip window at 0xA000_0000 - 0xA0FF_FFFF. They are not in
+ * the XSA of the ZCU106, so nothing generates their nodes, and their drivers are
+ * built into the kernel: described here they would probe during boot, and a
+ * register access through the window while the Aurora / Chip2Chip link is down
+ * never completes. They are applied at run time as a device-tree overlay once
+ * the link is up (c2c-link-status, c2c-overlay). This tree is built with
+ * symbols (dtc -@), so an overlay can reference its labels (&amba_pl, &gic ...).
+ */
+
+/*
+ * UART (ttyPS console):
+ *   The 2025.2 lopper/gen-machineconf flow emits port-number = <0> on BOTH
+ *   uart0 (ff000000) and uart1 (ff010000), so the ttyPS0/ttyPS1 assignment is
+ *   left to probe order. The console of this board is on psu_uart_0, so pin the
+ *   port numbers (and the serial aliases) explicitly.
+ *
+ * Kernel command line:
+ *   On the ZynqMP SD boot of the EDF flow the kernel command line is this
+ *   /chosen/bootargs (boot.scr reads it from the device tree embedded in
+ *   BOOT.BIN and appends "root=/dev/mmcblk0p3 ro rootwait ..."). APPEND in
+ *   local.conf never reaches the kernel, so the options are set here. The first
+ *   four are the ones gen-machineconf generates. clk_ignore_unused is REQUIRED:
+ *   the PS fabric clocks (pl_clk*) feed the Chip2Chip / Aurora logic, which has
+ *   no Linux clock consumer, and would otherwise be gated at late init.
+ *   cma=1024M: the capture buffers of the two 1080p pipelines are allocated from
+ *   CMA (videobuf2-dma-contig) and the kernel default is 256 MB. The remote
+ *   frame buffer writers are 32-bit AXI masters, so the buffers have to be in
+ *   the low 2 GB of the DDR; the default CMA area is placed below 4 GB, i.e. in
+ *   the low DDR bank of this board (0x0000_0000 - 0x7FFF_FFFF).
+ */
+&uart0 {
+	port-number = <0>;
+};
+
+&uart1 {
+	port-number = <1>;
+};
+
+/ {
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+	};
+
+	chosen {
+		bootargs = "earlycon console=ttyPS0,115200 clk_ignore_unused init_fatal_sh=1 cma=1024M xlnx_mixer.connect_drm_bridge=1";
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+/*
+ * xlnx_mixer.connect_drm_bridge=1 (above) switches the video mixer to the DRM
+ * bridge interface, which is how the PL mixer reaches the PS DisplayPort in
+ * 2025.2: the dpsub no longer registers itself as an "xlnx_bridge", so without
+ * this the mixer comes up with a CRTC and planes but NO connector, and modetest
+ * reports zero connectors. The mixer is built into the kernel, so the parameter
+ * can only be given on the command line. See docs/source/display.md.
+ */
+
+/*
+ * Keep the PS fabric clock pl_clk0 (PL0_REF = <&zynqmp_clk 71>) running.
+ *
+ * pl_clk0 is the ONLY clock of the PL half of this design: the AXI-Lite side of
+ * the AXI Chip2Chip core, the Aurora init_clk and the link status AXI GPIO all
+ * run from it. sdtgen describes it with an "xlnx,fclk" node (clocking0), but the
+ * lopper Linux-domain pass deletes every "xlnx,fclk" node, which leaves the link
+ * status GPIO as the only Linux consumer of the clock. gpio-xilinx runtime-
+ * suspends at the end of its probe and then calls clk_disable(); with no other
+ * consumer the clock framework asks the PMU firmware to gate pl_clk0. That would
+ * take the Aurora link down and make every access to the PL stall the AXI bus.
+ * clk_ignore_unused does not help: it only stops the late sweep of clocks that
+ * were never claimed, not an explicit disable by a driver.
+ *
+ * The AMD fclk driver (CONFIG_XILINX_FCLK=y in the EDF kernel) enables its clock
+ * at probe and never releases it, so this node pins pl_clk0 on. The rate is left
+ * as programmed by the FSBL (psu_init): 100 MHz.
+ */
+&amba_pl {
+	c2c_fclk0: fclk0 {
+		compatible = "xlnx,fclk";
+		status = "okay";
+		clocks = <&zynqmp_clk 71>;
+	};
+};
+
+/*
+ * PS GEM3 (board RJ45): the SDT flow does not describe the board-level
+ * TI DP83867 PHY, so Linux falls back to the Generic PHY driver and the
+ * RGMII clock delays are never programmed - the link negotiates 1G but
+ * passes no packets. Values from the official zynqmp-zcu106-revA.dts
+ * (PHY at MDIO address 0xc). The fixed MAC replaces the random one the
+ * SDT flow leaves us with, keeping DHCP leases stable across boots.
+ * U-Boot uses this same tree, so its networking is fixed as well.
+ */
+&gem3 {
+	local-mac-address = [00 0a 35 06 21 07];
+	phy-handle = <&gem3_phy>;
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gem3_phy: ethernet-phy@c {
+			compatible = "ethernet-phy-id2000.a231";
+			reg = <0xc>;
+			ti,rx-internal-delay = <0x8>;
+			ti,tx-internal-delay = <0xa>;
+			ti,fifo-depth = <0x1>;
+			ti,dp83867-rxctrl-strap-quirk;
+		};
+	};
+};
+
+/*
+ * ============================================================================
+ * DisplayPort output of the two camera streams
+ * ============================================================================
+ *
+ * Hardware (Vivado/src/bd/bd_zynqmp.tcl, hierarchy "display_pipeline"):
+ *
+ *   PS DDR --> v_mix layer1/layer2 --> v_axi4s_vid_out --> PS DP live video in
+ *                  ^                        ^
+ *                  |                        +-- timing from v_tc
+ *                  +-- pixel clock from clk_wiz (dynamically reconfigured)
+ *
+ * The nodes themselves (reg, interrupts, reset-gpios, the layer_N children,
+ * xlnx,bpc / ppc / num-layers / dma-addr-width, the dpsub phys and its
+ * ports/port@N shells) are all generated from the XSA by sdtgen + lopper. What
+ * is added below is only what the generator cannot know: the properties the
+ * 2025.2 drivers require but that are not in the hardware description, and the
+ * OF-graph links between the mixer, the DisplayPort and the physical connector.
+ *
+ * NOTE: these overrides reference labels emitted by the generator
+ * (display_pipeline_v_mix_0, display_pipeline_v_tc_0,
+ * display_pipeline_clk_wiz_0, mixer_crtcdisplay_pipeline_v_mix_0). They follow
+ * from the block-design hierarchy and instance names, but CHECK THEM against
+ * the generated tree after a hardware change:
+ *   grep -nE 'v_mix|v_tc|clk_wiz' Yocto/zcu106/build/conf/dts/*linux*.dts
+ */
+
+/ {
+	/*
+	 * DisplayPort APB clock. The dpsub needs a "dp_apb_clk"; the generated
+	 * tree does not give it one, and the rate only has to match what the PS
+	 * actually runs the APB at (100 MHz).
+	 */
+	dp_aclk: dp_aclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <100000000>;
+		clock-accuracy = <100>;
+	};
+
+	/*
+	 * PS-GTR reference clock for the DisplayPort lanes. The generated pcw
+	 * fragment points the DP phys at reference clock 3
+	 * (xlnx,phys = <&psgtr N 6 N 3>) but declares no clocks on the psgtr
+	 * node, so xpsgtr_xlate rejects reference clock 3 with "Invalid reference
+	 * clock number 3" and the DP probe fails with -EINVAL. 27 MHz is what the
+	 * FSBL programs the ZCU106's Si5341 to deliver on that input, and matches
+	 * PSU__DP__REF_CLK_FREQ in the block design.
+	 */
+	dp_phy_refclk: dp_phy_refclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <27000000>;
+	};
+
+	/*
+	 * The physical DisplayPort socket. zynqmp_dpsub_parse_dt() refuses to
+	 * probe ("DP output port not connected", -EINVAL) unless its output port
+	 * (port@5) leads somewhere, and the connector is also what supplies EDID
+	 * and hot-plug to the DRM connector the mixer builds.
+	 */
+	dp_connector: dp-connector {
+		compatible = "dp-connector";
+		type = "full-size";
+		port {
+			dp_connector_in: endpoint {
+				remote-endpoint = <&dp_out>;
+			};
+		};
+	};
+};
+
+&psgtr {
+	clocks = <&dp_phy_refclk>;
+	clock-names = "ref3";
+};
+
+/*
+ * Keep the PS fabric clock pl_clk1 (PL1_REF = <&zynqmp_clk 72>) running, for the
+ * same reason as pl_clk0 above: it is the AXI and datapath clock of the video
+ * mixer, and no driver holds it on outside a modeset (the mixer only enables its
+ * clock while a mode is active). Pinning it here keeps the mixer's AXI-Lite
+ * registers readable at any time - which is what the display checks in
+ * docs/source/display.md rely on.
+ */
+&amba_pl {
+	c2c_fclk1: fclk1 {
+		compatible = "xlnx,fclk";
+		status = "okay";
+		clocks = <&zynqmp_clk 72>;
+	};
+};
+
+/*
+ * DisplayPort subsystem.
+ *
+ * "dp_live_video_in_clk" is what tells the driver the pixel clock comes from the
+ * PL: with it present, vid_clk_from_ps is false and the dpsub runs its layers in
+ * LIVE mode, taking pixels from the mixer instead of the DPDMA. The driver also
+ * calls clk_set_rate() on this clock for every modeset, which is what retunes
+ * the PL clocking wizard to the mode's pixel clock.
+ *
+ * Clock indices are numeric because the EDF device-tree recipe sets
+ * KERNEL_INCLUDE = "", so dt-bindings headers are not available here:
+ *   16 = DP_VIDEO_REF, 17 = DP_AUDIO_REF (include/dt-bindings/clock/xlnx-zynqmp-clk.h)
+ */
+&zynqmp_dpsub {
+	status = "okay";
+	clocks = <&dp_aclk>, <&zynqmp_clk 17>, <&zynqmp_clk 16>, <&display_pipeline_clk_wiz_0 0>;
+	clock-names = "dp_apb_clk", "dp_aud_clk", "dp_vtc_pixel_clk_in", "dp_live_video_in_clk";
+	xlnx,bridge = <&display_pipeline_v_tc_0>;
+};
+
+/* dpsub port@0 = live video in: wire it to the mixer's CRTC endpoint */
+&live_video {
+	dp_encoder: endpoint {
+		remote-endpoint = <&mixer_crtcdisplay_pipeline_v_mix_0>;
+	};
+};
+
+/* dpsub port@5 = the DisplayPort output itself: wire it to the connector */
+&out_dp {
+	dp_out: endpoint {
+		remote-endpoint = <&dp_connector_in>;
+	};
+};
+
+&mixer_crtcdisplay_pipeline_v_mix_0 {
+	remote-endpoint = <&dp_encoder>;
+};
+
+/*
+ * Video mixer.
+ *
+ * xlnx,video-format is HARD REQUIRED by xlnx_mixer (probe fails with
+ * "'xlnx,video-format' property missing"). It is the format of the mixer's
+ * master layer and the driver turns it into the media bus format it offers the
+ * DisplayPort bridge:
+ *   0 = RGB     -> MEDIA_BUS_FMT_RGB888_1X24
+ *   1 = YUV444  -> MEDIA_BUS_FMT_VUY8_1X24
+ *   2 = YUV422  -> MEDIA_BUS_FMT_UYVY8_1X16
+ * This design uses 0 (RGB), matching CONFIG.VIDEO_FORMAT {0} on the IP, because
+ * the camera frames are packed RGB24 and RGB is in the DP's list of accepted
+ * live input formats - so no colour space conversion happens anywhere.
+ * It MUST agree with the IP configuration in the block design.
+ *
+ * xlnx,disp-bridge is deliberately NOT set. It selects the legacy xlnx_bridge
+ * path, whose bus format for an RGB master is MEDIA_BUS_FMT_RBG888_1X24 - which
+ * the DisplayPort does NOT accept. With connect_drm_bridge=1 the DRM bridge path
+ * is used instead and the format comes from xlnx,video-format above.
+ */
+&display_pipeline_v_mix_0 {
+	xlnx,bridge = <&display_pipeline_v_tc_0>;
+	xlnx,video-format = <0>;
+
+	/*
+	 * "reset-gpios" is hard required by xlnx_mixer (devm_gpiod_get(dev,
+	 * "reset") in probe; without it the probe fails with "No reset gpio info
+	 * from dts for mixer"). It is GENERATED from the block design, which drives
+	 * v_mix/ap_rst_n from PS EMIO GPIO bit 0 - EMIO starts at Linux gpio 78.
+	 * VERIFIED on the SDT of this XSA: sdtgen emits
+	 *     reset-gpios = <&gpio 78 1>;
+	 * so nothing is needed here. Re-check after any change to the EMIO wiring:
+	 *     grep -A3 reset-gpios Yocto/zcu106/sdt/pl.dtsi
+	 *
+	 * Also generated correctly and NOT overridden here (verified on the same
+	 * SDT): clocks = <&zynqmp_clk 72> (pl_clk1, 250 MHz), interrupts SPI 93,
+	 * xlnx,num-layers = <3>, xlnx,dma-addr-width = <32>, and
+	 * xlnx,vformat = "BG24" on layer_0/1/2 - which is DRM_FORMAT_BGR888, i.e.
+	 * exactly the bytes the remote pipeline writes. There is no
+	 * "xlnx,logo-layer" boolean on this node, which matters: with it present
+	 * xlnx_mix_dt_parse returns early and never reads xlnx,video-format.
+	 */
+};
+
+/*
+ * Timing controller.
+ *
+ * xlnx,pixels-per-clock MUST be overridden. sdtgen emits the IP's *maximum*
+ * (verified on this XSA: xlnx,pixels-per-clock = <0x4>), not the configured
+ * value, while this pipeline runs one pixel per clock throughout
+ * (CONFIG.SAMPLES_PER_CLOCK {1} on the mixer). The bridge driver reads this
+ * property to compute the timing it programs, so leaving it at 4 gives a
+ * completely wrong line length.
+ *
+ * The compatible is narrowed to the bridge string. The generated list is
+ * "xlnx,v-tc-6.2", "xlnx,bridge-v-tc-6.1"; the DRM bridge driver (xlnx_vtc)
+ * binds only the second, so this is belt and braces against a future generator
+ * adding "xlnx,v-tc-6.1" (which would pull in the V4L2 driver instead).
+ *
+ * NOTE the node is named v_tc_0@..., so the platform device is
+ * "a2010000.v_tc_0", not "a2010000.v_tc".
+ */
+&display_pipeline_v_tc_0 {
+	compatible = "xlnx,bridge-v-tc-6.1";
+	xlnx,pixels-per-clock = <1>;
+};
+
+/*
+ * The clocking wizard is referenced as a clock provider with one cell
+ * (<&display_pipeline_clk_wiz_0 0>); #address-cells is needed for the node to
+ * be well formed once it has child addressing from the generator.
+ */
+&display_pipeline_clk_wiz_0 {
+	#address-cells = <2>;
+};

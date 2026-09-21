@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-poke - write a 32-bit word to a physical address. An address inside the
+# AXI Chip2Chip window is only written when the link is up.
+#
+# NOTE: devmem2 performs THREE bus accesses for one write: it reads the word,
+# writes it, then reads it back. Harmless on plain registers (AXI GPIO, BRAM);
+# do not use it on a register whose read has a side effect (clear-on-read
+# status, FIFO data).
+
+. /usr/share/c2c-tools/c2c-functions.sh
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} [-f] ADDRESS VALUE
+  ADDRESS  physical address, hexadecimal (0x...) or decimal, word aligned
+  VALUE    32-bit value, hexadecimal (0x...) or decimal
+  -f       force: skip the link check for an address in the Chip2Chip window
+           (0xA0000000 - 0xA0FFFFFF). With the link down the write stalls the bus.
+Exit status: 0 done, 1 refused because the link is down, 2 error
+EOF
+}
+
+force=0
+while getopts fh opt; do
+	case $opt in
+	f) force=1 ;;
+	h)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+shift $((OPTIND - 1))
+
+[ $# -eq 2 ] || {
+	usage >&2
+	exit 2
+}
+addr=$1
+value=$2
+c2c_is_num "$addr" || c2c_die "bad address: $addr"
+c2c_is_num "$value" || c2c_die "bad value: $value"
+[ $((addr & 3)) -eq 0 ] || c2c_die "address is not word aligned: $addr"
+
+c2c_need_root
+
+a=$(printf '0x%08X' $((addr)))
+v=$(printf '0x%08X' $((value & 0xFFFFFFFF)))
+c2c_guard "$a" "$force"
+c2c_wr32 "$a" "$v" || c2c_die "write of $a failed"
+echo "$a <- $v"

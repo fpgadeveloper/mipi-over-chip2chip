@@ -1,0 +1,665 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-cameras - bring up the two remote MIPI camera pipelines of the MIPI over
+# Chip2Chip design automatically. This is what c2c-cameras.service runs at boot;
+# it is equally usable by hand (see "c2c-cameras help").
+#
+# The cameras are not on this board. They hang off the AUBoard 15P and are
+# reached through the AXI Chip2Chip window 0xA000_0000 - 0xA0FF_FFFF. Their
+# drivers are built into the kernel and touch those registers in probe, and a
+# register access while the link is DOWN never completes and hangs the CPU. That
+# is why their device-tree nodes are not in the base device tree, and why this
+# script exists: it does the checks that make applying them safe, in this order.
+#
+#   1. wait for the Chip2Chip link            (c2c-link-status, a LOCAL register)
+#   2. probe the AUBoard for the camera design (read-only, see identify_design)
+#   3. quiesce the remote frame buffer writers (see quiesce_remote)
+#   4. apply the device-tree overlay, once
+#   5. wait for /dev/media* and /dev/video*
+#   6. configure both pipelines (c2c-init-cams) and apply the default controls
+#
+# Without the second board, steps 1 and 2 fail, nothing is applied and the
+# ZCU106 boots and runs completely normally. Configuration:
+# /etc/default/c2c-cameras.
+#
+# Exit status: 0 cameras ready, 2 usage/environment error, 3 the link never came
+# up, 4 the link is up but the AUBoard is not running the camera design,
+# 5 the AUBoard was reset while this Linux kept running (see remote_health),
+# 1 anything else (overlay rejected, devices never appeared, init failed).
+
+. /usr/share/c2c-tools/c2c-functions.sh
+
+DEFAULTS=${C2C_CAMERAS_DEFAULTS:-/etc/default/c2c-cameras}
+# shellcheck disable=SC1090
+[ -r "$DEFAULTS" ] && . "$DEFAULTS"
+
+OVERLAY_NAME=${C2C_OVERLAY_NAME:-cams}
+OVERLAY_FILE=${C2C_OVERLAY_FILE:-/lib/firmware/c2c/c2c-cams.dtbo}
+LINK_TIMEOUT=${C2C_LINK_TIMEOUT:-60}
+DEV_TIMEOUT=${C2C_DEV_TIMEOUT:-30}
+SRC_W=${C2C_CAM_WIDTH:-1920}
+SRC_H=${C2C_CAM_HEIGHT:-1080}
+OUT_W=${C2C_CAM_OUT_WIDTH:-$SRC_W}
+OUT_H=${C2C_CAM_OUT_HEIGHT:-$SRC_H}
+CTRLS=${C2C_CAM_CTRLS-red_gamma_correction_1_0_1_10=5,green_gamma_correction_1_0_1_1=6,blue_gamma_correction_1_0_1_10=5}
+ENABLED=${C2C_CAMERAS_ENABLE:-1}
+PROBE=${C2C_PROBE:-1}
+NOLINK_STATUS=${C2C_NOLINK_STATUS:-1}
+STATE=${C2C_STATE_FILE:-/run/c2c-cameras.state}
+# The generation this boot stamped into the AUBoard's scratch BRAM. /run is
+# tmpfs, so it disappears on a reboot of THIS board - which is right: after a
+# reboot the overlay is gone too and there is nothing to compare against.
+GENFILE=${C2C_GEN_FILE:-/run/c2c-cameras.gen}
+
+# ---------------------------------------------------------------------------
+# Remote register map (docs/link_contract_deviations.md, "Phase 2").
+# Only these three kinds of register are ever touched by this script, and all of
+# them are AXI GPIO / HLS control registers that are NEVER held in reset:
+#   SYS_STATUS  the AUBoard's own link-status GPIO; exists in every design of
+#               this repository, so a successful read means "the remote register
+#               path answers".
+#   <cam>_GPIO  the per-pipeline AXI GPIO. Exists ONLY in the camera design.
+#               32 bit, one channel, reset value 0x0000_0001:
+#                 bit 0 camera enable (1 at reset)   bit 3 v_proc_ss reset_n
+#                 bit 2 v_demosaic reset_n           bit 4 v_gamma_lut reset_n
+#                 bit 6 v_frmbuf_wr reset_n          (bits 1, 5 unused)
+#               Power-up reads 0x01, after the Linux drivers have released the
+#               resets it reads 0x5D. Bits 7..31 are always 0.
+#   <cam>_FB    the v_frmbuf_wr HLS control register (AP_CTRL at offset 0):
+#               bit 0 ap_start, bit 1 ap_done, bit 2 ap_idle, bit 7 auto_restart.
+#               Only read/written when the GPIO says the IP is out of reset.
+# Every OTHER register of a video IP is off limits until its driver has probed:
+# an access to an IP held in reset never completes and blocks the whole register
+# path of both boards until the AUBoard is re-programmed.
+# ---------------------------------------------------------------------------
+SYS_STATUS=0xA0000008
+CAM_GPIOS="0xA0120000 0xA0220000"
+CAM0_GPIO=0xA0120000
+CAM0_FB=0xA0150000
+CAM2_GPIO=0xA0220000
+CAM2_FB=0xA0250000
+GPIO_KNOWN_BITS=0x7F
+GPIO_CAM_ENABLE=0x1
+FB_RESET_N=0x40
+FB_AP_START=0x1
+FB_AP_IDLE=0x4
+FB_AUTO_RESTART=0x80
+# Every video reset_n of a pipeline: v_demosaic (2), v_proc_ss (3),
+# v_gamma_lut (4), v_frmbuf_wr (6). All four are released by the Linux drivers
+# in their probe, so with the overlay applied they MUST read back set.
+GPIO_VIDEO_RESETS=0x5C
+
+# Generation marker in the AUBoard's scratch BRAM (0xA001_0000, 8 KiB). The last
+# 16 bytes are used so the marker never collides with c2c-latency, which works
+# at the base of the same BRAM. The BRAM's contents come from the AUBoard's
+# bitstream, so a power cycle or a re-configuration of that board clears them -
+# which is precisely the event this marker is here to catch.
+MARK_MAGIC_ADDR=0xA0011FF0
+MARK_GEN_ADDR=0xA0011FF4
+MARK_MAGIC=0x43324D4B
+
+# ---------------------------------------------------------------------------
+# Logging. Under systemd, stdout is the journal and a "<N>" prefix sets the
+# priority; from a terminal the prefix would only be noise, so it is used only
+# when systemd handed us a journal stream.
+# ---------------------------------------------------------------------------
+if [ -n "${JOURNAL_STREAM:-}" ]; then
+	_p_err='<3>'
+	_p_warn='<4>'
+	_p_info='<6>'
+else
+	_p_err='c2c-cameras: '
+	_p_warn='c2c-cameras: '
+	_p_info='c2c-cameras: '
+fi
+info() { echo "$_p_info$*"; }
+warn() { echo "$_p_warn$*"; }
+err() { echo "$_p_err$*" >&2; }
+
+set_state() {
+	printf 'STATE=%s\nREASON=%s\nTIME=%s\n' "$1" "$2" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+		>"$STATE" 2>/dev/null || :
+}
+
+# ---------------------------------------------------------------------------
+# 1. Wait for the Chip2Chip link. The status register is an AXI GPIO in the
+#    ZCU106's own PL (0xA100_0000), so reading it is safe in any link state.
+# ---------------------------------------------------------------------------
+wait_for_link() {
+	waited=0
+	while :; do
+		c2c_link_up
+		rc=$?
+		[ "$rc" -eq 2 ] && {
+			err "cannot read the link status at $C2C_STATUS_ADDR"
+			return 2
+		}
+		[ "$rc" -eq 0 ] && {
+			info "Chip2Chip link UP (status $C2C_STATUS) after ${waited}s"
+			return 0
+		}
+		[ "$waited" -ge "$LINK_TIMEOUT" ] && break
+		[ "$waited" -eq 0 ] && info "waiting up to ${LINK_TIMEOUT}s for the Chip2Chip link (status $C2C_STATUS)"
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# 2. Is the AUBoard running the camera design?
+#
+#    The link being up only proves that two AXI Chip2Chip cores found each
+#    other. The AUBoard may be running an older/other bitstream whose address
+#    map has no camera pipelines - applying the overlay then makes every driver
+#    probe an address that does not exist.
+#
+#    An unmapped address in the window is NOT a hang: the AUBoard's AXI4-Lite
+#    interconnect answers with DECERR, which arrives here as a synchronous
+#    external abort, i.e. SIGBUS for the reading process only. Measured on
+#    hardware (2026-09-20): reading the documented unmapped hole 0xA001_8000
+#    killed devmem2 with signal 7 and the very next read of a mapped register
+#    succeeded - no stall, nothing in dmesg. That is what makes this probe safe,
+#    and it is why the probe reads registers that exist ONLY in the camera
+#    design: if they are absent the read fails instead of returning nonsense.
+#
+#    Signature required of both per-pipeline GPIOs: the read succeeds, no bit
+#    above bit 6 is set, and bit 0 (camera enable) is set.
+# ---------------------------------------------------------------------------
+identify_design() {
+	[ "$PROBE" = 1 ] || {
+		warn "design probe disabled (C2C_PROBE=0)"
+		return 0
+	}
+
+	if ! v=$(c2c_rd32 "$SYS_STATUS" 2>/dev/null); then
+		err "the AUBoard does not answer at $SYS_STATUS although the link is up"
+		return 1
+	fi
+	info "AUBoard link status register $SYS_STATUS = $v"
+
+	for g in $CAM_GPIOS; do
+		if ! v=$(c2c_rd32 "$g" 2>/dev/null); then
+			err "no camera-pipeline GPIO at $g: the AUBoard is running a design" \
+				"without the MIPI camera pipelines (a DECERR/SIGBUS on this read is" \
+				"exactly what an older bitstream looks like). Not applying the overlay."
+			return 1
+		fi
+		if [ $((v & ~GPIO_KNOWN_BITS)) -ne 0 ] || [ $((v & GPIO_CAM_ENABLE)) -eq 0 ]; then
+			err "camera-pipeline GPIO at $g reads $v, which is not a value this" \
+				"design can produce (expected bits 0..6 only, bit 0 set)." \
+				"Not applying the overlay."
+			return 1
+		fi
+		info "camera-pipeline GPIO $g = $v (camera enabled)"
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# 2b. Is the remote design still the one our drivers probed?
+#
+#     THE FAILURE THIS CATCHES. If the AUBoard loses power (or is
+#     re-programmed) while this Linux keeps running, the link retrains by
+#     itself within about two seconds and everything here still LOOKS fine: the
+#     overlay is still applied, the device nodes are still there, the link
+#     status reads 0x0000000F and the per-pipeline GPIOs still answer. But the
+#     AUBoard came back in its power-up state with every video reset asserted,
+#     and the Linux drivers release those resets only in their probe, which
+#     will not run again. The first capture then reads a frame buffer writer
+#     that is held in reset, the read never completes, and the CPU hangs hard
+#     enough that SSH and the UART both stop (measured, acceptance test T5).
+#     Before this check the service reported "remote cameras are ready" in
+#     exactly that state.
+#
+#     HOW IT IS DETECTED. Read-only, two independent signals, both cheap:
+#
+#     1. THE PIPELINE GPIOs - the authoritative one. Bits 2, 3, 4 and 6 are the
+#        reset_n of v_demosaic, v_proc_ss, v_gamma_lut and v_frmbuf_wr. They
+#        read 0 at power-up and are set by the drivers at probe. So "the
+#        overlay is applied but a reset_n reads 0" cannot be a working
+#        pipeline - it is the dangerous state itself, observed directly rather
+#        than inferred. This is the check to trust: it needs no stored state,
+#        writes nothing, and cannot miss the hazard, because the hazard IS the
+#        reset bit.
+#
+#     2. THE GENERATION MARKER in the AUBoard's scratch BRAM - and it is NOT
+#        redundant. A successful bring-up stamps a magic word and a random
+#        generation there; reloading the AUBoard's fabric clears the BRAM.
+#
+#        MEASURED, and the reason this exists (2026-09-20, T5 re-test): the
+#        GPIO signal is correct but NOT DURABLE. Right after the AUBoard was
+#        power-cycled both GPIOs read 0x01 and the GPIO check fired, exactly as
+#        intended. Then the display was stopped - an ordinary stream teardown -
+#        and both GPIOs read 0x5D again, with nobody having poked anything: the
+#        Linux gpio-xilinx driver keeps the output word in software, the video
+#        drivers touch their reset lines when a stream is released, and the
+#        driver duly wrote its cached 0x5D back into a register the mezzanine
+#        had reset to 0x01. The register then LOOKS healthy while the IPs are
+#        still dead - which is the same trap as hand-poking 0x5D, documented in
+#        Troubleshooting as a thing not to do, except that here the drivers did
+#        it by themselves. From that moment the marker is the only thing left
+#        that still knows, and it is what refused the next c2c-display run.
+#
+#     So: the GPIO is the FIRST check because it is direct, needs no stored
+#     state and is right from the instant the event happens; the marker is the
+#     LASTING one, because it cannot be rewritten by a driver's cached state.
+#     Neither is sufficient alone and both are cheap, so both are used. A
+#     marker that could not be written is reported as a warning, because the
+#     detection is weaker without it.
+#
+#     Both are skipped while the overlay is NOT applied: that is a cold boot or
+#     a warm reboot, where the GPIOs may legitimately read either 0x01 (the
+#     AUBoard just came up) or 0x5D (this board rebooted and left the AUBoard
+#     running), and the drivers have yet to probe.
+#
+#     Returns: 0 healthy, 3 link down, 4 not the camera design,
+#              5 the AUBoard was reset behind the drivers' back.
+#     Leaves a human-readable explanation in HEALTH_DETAIL.
+# ---------------------------------------------------------------------------
+remote_health() {
+	HEALTH_DETAIL=
+
+	c2c_link_up
+	case $? in
+	0) ;;
+	1)
+		HEALTH_DETAIL="the Chip2Chip link is DOWN (status ${C2C_STATUS}): the AUBoard 15P is off, not programmed, or the cable is out"
+		return 3
+		;;
+	*)
+		HEALTH_DETAIL="the link status register at $C2C_STATUS_ADDR cannot be read"
+		return 2
+		;;
+	esac
+
+	for _g in $CAM_GPIOS; do
+		if ! _v=$(c2c_rd32 "$_g" 2>/dev/null); then
+			HEALTH_DETAIL="no camera-pipeline GPIO at $_g: the AUBoard is not running the MIPI camera design"
+			return 4
+		fi
+		if [ $((_v & ~GPIO_KNOWN_BITS)) -ne 0 ] || [ $((_v & GPIO_CAM_ENABLE)) -eq 0 ]; then
+			HEALTH_DETAIL="camera-pipeline GPIO $_g reads $_v, which this design cannot produce"
+			return 4
+		fi
+		# Only meaningful once the drivers have probed, i.e. once the overlay
+		# is applied.
+		if overlay_applied && [ $((_v & GPIO_VIDEO_RESETS)) -ne $((GPIO_VIDEO_RESETS)) ]; then
+			HEALTH_DETAIL="the device-tree overlay is applied, so the video drivers have probed and released their resets - but the pipeline GPIO $_g reads $_v, i.e. the video IPs are back in reset"
+			return 5
+		fi
+	done
+
+	# Secondary signal; only when this boot stamped a marker of its own.
+	if overlay_applied && [ -r "$GENFILE" ]; then
+		_want=$(cat "$GENFILE" 2>/dev/null)
+		_magic=$(c2c_rd32 "$MARK_MAGIC_ADDR" 2>/dev/null) || _magic=
+		_gen=$(c2c_rd32 "$MARK_GEN_ADDR" 2>/dev/null) || _gen=
+		if [ "$_magic" != "$MARK_MAGIC" ] || [ "$_gen" != "$_want" ]; then
+			HEALTH_DETAIL="the generation marker this boot wrote into the AUBoard scratch BRAM is gone (magic ${_magic:-unreadable}, generation ${_gen:-unreadable}, expected $MARK_MAGIC/$_want) - the AUBoard's fabric has been reloaded since the cameras were brought up"
+			return 5
+		fi
+	fi
+
+	HEALTH_DETAIL="link up, both pipelines out of reset"
+	return 0
+}
+
+# The message for exit status 5. One place, so the service, "health" and
+# "status" all say the same thing.
+explain_reset_behind_back() {
+	err "the mezzanine was reset behind the drivers' back - reboot the host" \
+		"(or power-cycle both boards)"
+	err "$HEALTH_DETAIL"
+	err "The AUBoard 15P lost power or was re-programmed while this Linux kept" \
+		"running. The link came back by itself, but the remote video IPs are in" \
+		"their power-up reset and only a driver probe releases them - and the" \
+		"overlay cannot be removed and re-applied. Capturing now would hang the" \
+		"CPU on a read that never completes."
+	err "Do this instead: reboot the ZCU106 BEFORE touching any camera" \
+		"('reboot'). If a capture has already hung the board, power-cycle BOTH" \
+		"boards - a ZCU106-only power cycle leaves the AUBoard's AXI path stuck."
+}
+
+# Stamp the generation marker after a successful bring-up. Best effort: the
+# marker is a corroborating signal, so a board whose scratch BRAM cannot be
+# written must still be able to run the cameras.
+mark_remote() {
+	_gen=$(od -An -tx4 -N4 /dev/urandom 2>/dev/null | tr -d ' \n\t')
+	case "$_gen" in
+	'' | *[!0-9a-fA-F]*) _gen=$(printf '%x' $(($(date +%s) & 0xFFFFFFFF))) ;;
+	esac
+	_gen=$(printf '0x%08X' $((0x$_gen & 0xFFFFFFFF)))
+	# Generation first, magic last: a torn write can then never look valid.
+	if c2c_wr32 "$MARK_GEN_ADDR" "$_gen" >/dev/null 2>&1 &&
+		c2c_wr32 "$MARK_MAGIC_ADDR" "$MARK_MAGIC" >/dev/null 2>&1; then
+		printf '%s\n' "$_gen" >"$GENFILE" 2>/dev/null || :
+		info "generation marker $_gen written to the AUBoard scratch BRAM"
+	else
+		rm -f "$GENFILE" 2>/dev/null || :
+		warn "could not write the generation marker to $MARK_MAGIC_ADDR;" \
+			"the pipeline GPIOs remain the reset detector"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. Quiesce the remote frame buffer writers.
+#
+#    This is what makes a WARM reboot of the ZCU106 safe. The AUBoard is not
+#    reset when this board reboots: if a capture was running, v_frmbuf_wr is
+#    still armed with AUTO_RESTART and keeps DMAing frames into whatever
+#    physical address the previous Linux had given it - into the DDR of the
+#    system that is now booting. And applying the overlay would assert its reset
+#    mid-burst (the GPIO driver writes xlnx,dout-default = 1 when it probes,
+#    which drops all four video resets), which can leave an AXI write hanging.
+#
+#    So before the overlay, and on stop, the writers are halted the same way
+#    their driver halts them: clear ap_start and auto_restart in AP_CTRL and
+#    wait for ap_idle. That is a graceful stop at the end of the current frame,
+#    not a reset. Only done when the pipeline's GPIO says the IP is out of
+#    reset - an IP in reset is not streaming and must not be touched.
+# ---------------------------------------------------------------------------
+quiesce_one() {
+	_gpio=$1
+	_fb=$2
+	_name=$3
+
+	_g=$(c2c_rd32 "$_gpio" 2>/dev/null) || {
+		warn "$_name: cannot read $_gpio, skipping quiesce"
+		return 0
+	}
+	if [ $((_g & FB_RESET_N)) -eq 0 ]; then
+		info "$_name: frame buffer writer is in reset (GPIO $_g), nothing to stop"
+		return 0
+	fi
+	_c=$(c2c_rd32 "$_fb" 2>/dev/null) || {
+		warn "$_name: cannot read the frame buffer control register $_fb"
+		return 0
+	}
+	if [ $((_c & (FB_AP_START | FB_AUTO_RESTART))) -eq 0 ]; then
+		info "$_name: frame buffer writer already idle (AP_CTRL $_c)"
+		return 0
+	fi
+	warn "$_name: frame buffer writer still running (AP_CTRL $_c) - halting it"
+	c2c_wr32 "$_fb" 0x0 || {
+		warn "$_name: could not write $_fb"
+		return 0
+	}
+	_n=0
+	while [ "$_n" -lt 20 ]; do
+		_c=$(c2c_rd32 "$_fb" 2>/dev/null) || break
+		[ $((_c & FB_AP_IDLE)) -ne 0 ] && break
+		_n=$((_n + 1))
+		sleep 0.1 2>/dev/null || sleep 1
+	done
+	info "$_name: frame buffer writer AP_CTRL now $_c"
+	return 0
+}
+
+quiesce_remote() {
+	quiesce_one "$CAM0_GPIO" "$CAM0_FB" CAM0
+	quiesce_one "$CAM2_GPIO" "$CAM2_FB" CAM2
+}
+
+# ---------------------------------------------------------------------------
+# 4./5. Overlay and device nodes.
+# ---------------------------------------------------------------------------
+overlay_applied() {
+	[ "$(cat "/sys/kernel/config/device-tree/overlays/$OVERLAY_NAME/status" 2>/dev/null)" = applied ]
+}
+
+# Number of capture nodes that belong to a remote pipeline. The name comes from
+# the overlay ("vcap_mipi_0_v_proc" / "vcap_mipi_2_v_proc"); reading it out of
+# sysfs touches no hardware.
+count_capture_nodes() {
+	_n=0
+	for _f in /sys/class/video4linux/video*/name; do
+		[ -r "$_f" ] || continue
+		case "$(cat "$_f" 2>/dev/null)" in
+		*vcap_mipi*) _n=$((_n + 1)) ;;
+		esac
+	done
+	echo "$_n"
+}
+
+wait_for_devices() {
+	_waited=0
+	while :; do
+		_n=$(count_capture_nodes)
+		if [ "$_n" -ge 2 ] && [ -e /dev/media0 ] && [ -e /dev/media1 ]; then
+			info "capture devices ready after ${_waited}s: $(echo /dev/video[0-9]* /dev/media[0-9]*)"
+			return 0
+		fi
+		[ "$_waited" -ge "$DEV_TIMEOUT" ] && break
+		sleep 1
+		_waited=$((_waited + 1))
+	done
+	err "only $_n of 2 remote capture devices appeared within ${DEV_TIMEOUT}s (see dmesg)"
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+do_start() {
+	if [ "$ENABLED" != 1 ]; then
+		info "disabled in $DEFAULTS (C2C_CAMERAS_ENABLE=$ENABLED), doing nothing"
+		set_state disabled "C2C_CAMERAS_ENABLE=$ENABLED"
+		return 0
+	fi
+	c2c_need_root
+
+	if ! wait_for_link; then
+		warn "the Chip2Chip link did not come up within ${LINK_TIMEOUT}s" \
+			"(status ${C2C_STATUS:-?}). The AUBoard 15P is off, not programmed," \
+			"or the cable is out - the cameras are NOT available."
+		warn "This is not fatal: the ZCU106 boots and runs normally without the" \
+			"second board. Power up and program the AUBoard, then retry with:" \
+			"systemctl restart c2c-cameras"
+		set_state no-link "link down after ${LINK_TIMEOUT}s"
+		[ "$NOLINK_STATUS" = 0 ] && return 0
+		return 3
+	fi
+
+	if ! identify_design; then
+		warn "the Chip2Chip link is up but the AUBoard is not running the MIPI" \
+			"camera design. Refusing to apply the overlay: its drivers would probe" \
+			"registers that do not exist. Program the AUBoard with the camera" \
+			"bitstream, then retry with: systemctl restart c2c-cameras"
+		set_state no-camera-design "design probe failed"
+		return 4
+	fi
+
+	# Nothing below here may run if the AUBoard was reset underneath the
+	# drivers: the overlay cannot be applied a second time, c2c-init-cams would
+	# only reconfigure the drivers' cached software state, and the "ready" this
+	# used to print sent the operator straight into a capture that hangs the
+	# CPU. Read-only, so it is safe in every state.
+	remote_health
+	if [ $? -eq 5 ]; then
+		explain_reset_behind_back
+		set_state mezzanine-reset "remote video IPs are in reset"
+		return 5
+	fi
+
+	quiesce_remote
+
+	if overlay_applied; then
+		info "overlay '$OVERLAY_NAME' is already applied, not applying it again"
+	else
+		[ -r "$OVERLAY_FILE" ] || {
+			err "overlay $OVERLAY_FILE not found"
+			set_state error "overlay file missing"
+			return 1
+		}
+		info "applying $OVERLAY_FILE as overlay '$OVERLAY_NAME'"
+		if ! c2c-overlay apply "$OVERLAY_NAME" "$OVERLAY_FILE"; then
+			err "the kernel rejected the overlay (see dmesg). The cameras are not available."
+			set_state error "overlay rejected"
+			return 1
+		fi
+	fi
+
+	wait_for_devices || {
+		set_state error "capture devices did not appear"
+		return 1
+	}
+
+	info "configuring both pipelines: sensor ${SRC_W}x${SRC_H} -> ${OUT_W}x${OUT_H}"
+	# c2c-init-cams ends with a page of capture examples that is useful on a
+	# terminal and only noise in the journal, so on success everything from
+	# "Capture examples" on is dropped and the interesting lines (which camera
+	# is which device) are logged one per journal entry. On failure the whole
+	# output is logged.
+	if _out=$(c2c-init-cams "$SRC_W" "$SRC_H" "$OUT_W" "$OUT_H" 2>&1); then
+		printf '%s\n' "$_out" | sed -n '/^Capture examples/q;/./p' |
+			while IFS= read -r _l; do info "$_l"; done
+	else
+		printf '%s\n' "$_out" | while IFS= read -r _l; do err "$_l"; done
+		err "c2c-init-cams failed"
+		set_state error "pipeline configuration failed"
+		return 1
+	fi
+
+	# Default picture controls. The pipeline has no auto-exposure and no white
+	# balance and the gamma LUT powers up linear, so without these the first
+	# capture out of a fresh boot is dark and green. Best effort: a control that
+	# a future kernel renames must not fail the boot.
+	if [ -n "$CTRLS" ]; then
+		# [0-9] and not *: /dev/video-cam0 and /dev/video-cam2 are udev
+		# symlinks to these same nodes (99-c2c-cameras.rules), so a plain
+		# /dev/video* would set every control twice.
+		for _v in /dev/video[0-9]*; do
+			[ -e "$_v" ] || continue
+			v4l2-ctl -d "$_v" --set-ctrl="$CTRLS" >/dev/null 2>&1 ||
+				warn "could not set '$CTRLS' on $_v"
+		done
+		info "default controls applied: $CTRLS"
+	fi
+
+	# Last, because it is the record that THIS bring-up succeeded against THIS
+	# AUBoard configuration.
+	mark_remote
+
+	set_state ready "cameras ready"
+	info "remote cameras are ready (c2c-cameras health = OK)"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# health - the cheap, read-only check a capture wrapper can call before it
+# opens a device. Touches only registers that are never held in reset.
+# ---------------------------------------------------------------------------
+do_health() {
+	c2c_need_root
+	remote_health
+	_rc=$?
+	case "$_rc" in
+	0) info "remote cameras: OK ($HEALTH_DETAIL)" ;;
+	5)
+		explain_reset_behind_back
+		;;
+	3 | 4)
+		err "remote cameras: NOT usable - $HEALTH_DETAIL"
+		;;
+	*)
+		err "remote cameras: cannot tell - $HEALTH_DETAIL"
+		;;
+	esac
+	return "$_rc"
+}
+
+do_stop() {
+	c2c_need_root
+	# Leave the remote pipelines in a state that survives this board going away:
+	# no frame buffer writer still DMAing into DDR that is about to be reused.
+	# The overlay is deliberately NOT removed (removing it unbinds a cascaded
+	# interrupt controller, a V4L2 graph and DMA channels, and every unbind
+	# touches remote registers).
+	if ! c2c_link_up; then
+		info "link is down, nothing to quiesce"
+		set_state stopped "link down"
+		return 0
+	fi
+	quiesce_remote
+	set_state stopped "remote frame buffer writers halted"
+	return 0
+}
+
+do_status() {
+	printf 'service state : %s\n' "$(sed -n 's/^STATE=//p' "$STATE" 2>/dev/null || echo unknown)"
+	printf 'reason        : %s\n' "$(sed -n 's/^REASON=//p' "$STATE" 2>/dev/null || echo -)"
+	if c2c_link_up; then
+		printf 'link          : UP (%s)\n' "$C2C_STATUS"
+	else
+		printf 'link          : DOWN (%s)\n' "${C2C_STATUS:-unreadable}"
+	fi
+	if overlay_applied; then
+		printf 'overlay       : %s applied\n' "$OVERLAY_NAME"
+	else
+		printf 'overlay       : %s NOT applied\n' "$OVERLAY_NAME"
+	fi
+	printf 'capture nodes : %s\n' "$(count_capture_nodes)"
+	# [0-9]: the stable names are symlinks to these, listed separately below.
+	printf 'devices       : %s\n' "$(echo /dev/video[0-9]* /dev/media[0-9]* 2>/dev/null)"
+	_stable=
+	for _s in /dev/video-cam0 /dev/video-cam2; do
+		[ -e "$_s" ] && _stable="$_stable $_s -> $(readlink -f "$_s")"
+	done
+	printf 'stable names  :%s\n' "${_stable:- none (99-c2c-cameras.rules not loaded?)}"
+	# The health line is what tells a "ready" service apart from one whose
+	# AUBoard was reset underneath it. Both look identical above.
+	remote_health
+	_rc=$?
+	if [ "$_rc" -eq 0 ]; then
+		printf 'health        : OK (%s)\n' "$HEALTH_DETAIL"
+	else
+		printf 'health        : FAILED, exit %s - %s\n' "$_rc" "$HEALTH_DETAIL"
+		[ "$_rc" -eq 5 ] && printf '                the mezzanine was reset behind the drivers back - reboot the host (or power-cycle both boards)\n'
+	fi
+	return "$_rc"
+}
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} start|stop|status|health|help
+
+  start   wait for the Chip2Chip link, check that the AUBoard runs the camera
+          design and has not been reset since the drivers probed, apply the
+          device-tree overlay once and configure both pipelines. Idempotent:
+          safe to run again at any time. This is what c2c-cameras.service runs
+          at boot; run it (or "systemctl restart c2c-cameras") by hand after
+          powering up or programming the AUBoard once the ZCU106 is already
+          running. NOTE: "systemctl start" does nothing while the unit is
+          already active - use "restart", which is safe (the overlay is never
+          applied twice).
+  stop    halt the remote frame buffer writers so they stop writing into this
+          board's DDR. Does NOT remove the overlay (which cannot be removed
+          safely). Run from the service at shutdown.
+  status  link, overlay, capture devices, stable names and health.
+  health  read-only, one line, exit status only: is it safe to capture right
+          now? Call this from a capture wrapper before opening a device.
+
+Configuration: $DEFAULTS
+Exit status: 0 ready, 2 usage/environment, 3 link never came up,
+             4 the AUBoard is not running the camera design,
+             5 the AUBoard was reset while this Linux kept running (reboot
+               required - capturing would hang the CPU),
+             1 other failure.
+EOF
+}
+
+case "${1:-start}" in
+start) do_start ;;
+stop) do_stop ;;
+status) do_status ;;
+health) do_health ;;
+help | -h | --help)
+	usage
+	exit 0
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac

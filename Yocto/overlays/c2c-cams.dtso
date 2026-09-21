@@ -1,0 +1,775 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+
+/*
+ * c2c-cams.dtso - run-time device-tree overlay: the two MIPI camera pipelines of
+ * the AUBoard 15P, as the Linux of the ZCU106 sees them through the AXI Chip2Chip
+ * window (MIPI over Chip2Chip design).
+ *
+ *   IMX219 --CSI-2--> mipi_csi2_rx_subsystem -> [axis_subset_converter 10->8 bit]
+ *     -> v_demosaic -> v_gamma_lut -> v_proc_ss (scaler only) -> v_frmbuf_wr
+ *     ==AXI4 over the link==> DDR of the ZCU106 ---> /dev/videoN (xlnx,video)
+ *
+ * WHY AN OVERLAY: every driver below is built into the kernel and touches its
+ * registers in probe. A register access through the window while the Aurora /
+ * Chip2Chip link is down never completes. So these nodes are NOT in the base
+ * tree; "c2c-overlay apply cams c2c-cams.dtbo" adds them after a link check.
+ * APPLY ONCE PER BOOT - do not remove the overlay (see README.md).
+ *
+ * THIS FILE NEEDS THE C PREPROCESSOR (the constants below). Build it with
+ * ./build-overlay.sh, which also writes a preprocessed copy that a plain
+ * "dtc -@" (for example the one on the target) can compile.
+ *
+ * Every statement about a driver was checked against the kernel of the image,
+ * linux-xlnx 6.12.40 (file:line in the comments refer to that tree).
+ *
+ * Only C comments from here on: the file goes through cpp in assembler mode.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/* ==========================================================================
+ * CONSTANTS - everything that comes from the AUBoard hardware report.
+ * Source: docs/link_contract_deviations.md "Phase 2" + Vivado/src/bd/bd_fpga.tcl.
+ * [A] marks a value that is still an ASSUMPTION (see README.md, "Open values").
+ * ========================================================================== */
+
+/* An address is written ONCE, without 0x: it is used for the unit address of the
+ * node name (name@ADDR) and, through HEX(), for the reg property. */
+#define _HEX(x)			0x##x
+#define HEX(x)			_HEX(x)
+
+/* --- the Chip2Chip window and the DMA window of the remote bus masters ------ */
+#define C2C_WIN			a0000000	/* AXI4-Lite window, as seen by the APU */
+#define C2C_WIN_SIZE		0x01000000	/* 16 MB */
+/* The frame buffer writers are 32-bit masters that reach ONLY 0x0000_0000 -
+ * 0x7FFF_FFFF of the ZCU106 (1:1, DDR low, through S_AXI_HP0_FPD, no SMMU). */
+#define C2C_DMA_BASE		0x00000000
+#define C2C_DMA_SIZE		0x80000000
+
+/* --- interrupt: remote axi_intc -> link interrupt 0 -> pl_ps_irq0[0] -------- */
+#define C2C_GIC_SPI		89		/* GIC SPI number; 89..92 = pl_ps_irq0[0..3] */
+#define INTC_ADDR		a0040000
+#define INTC_NUM_INPUTS		10		/* C_NUM_INTR_INPUTS */
+#define INTC_KIND_OF_INTR	0x0		/* bit n = 1: input n is EDGE. All 10 are level. */
+/* INTC input numbers (= Linux interrupt specifier, first cell) */
+#define CAM0_CSI_IRQ		0
+#define CAM0_FRMBUF_IRQ		1
+#define CAM0_IIC_IRQ		2
+#define CAM2_CSI_IRQ		3
+#define CAM2_FRMBUF_IRQ		4
+#define CAM2_IIC_IRQ		5
+/* inputs 6..9 = demosaic / gamma of CAM0 / CAM2: wired, but their Linux drivers
+ * use no interrupt, so they are not described (they stay masked in the INTC). */
+
+/* --- register blocks: CAM0 at 0xA010_0000, CAM2 at 0xA020_0000 -------------- */
+#define CAM0_CSI_ADDR		a0100000	/* mipi_csi2_rx_subsystem */
+#define CAM0_IIC_ADDR		a0110000	/* axi_iic (sensor bus) */
+#define CAM0_GPIO_ADDR		a0120000	/* axi_gpio (enable + resets) */
+#define CAM0_DEMOSAIC_ADDR	a0130000	/* v_demosaic */
+#define CAM0_GAMMA_ADDR		a0140000	/* v_gamma_lut */
+#define CAM0_FRMBUF_ADDR	a0150000	/* v_frmbuf_wr */
+#define CAM0_VPSS_ADDR		a0180000	/* v_proc_ss (256K) */
+
+#define CAM2_CSI_ADDR		a0200000
+#define CAM2_IIC_ADDR		a0210000
+#define CAM2_GPIO_ADDR		a0220000
+#define CAM2_DEMOSAIC_ADDR	a0230000
+#define CAM2_GAMMA_ADDR		a0240000
+#define CAM2_FRMBUF_ADDR	a0250000
+#define CAM2_VPSS_ADDR		a0280000
+
+#define SZ_64K			0x00010000
+#define SZ_256K			0x00040000
+
+/* --- bits of the per-camera axi_gpio (32 bit, all outputs, reset value 0x1) -- */
+#define GPIO_BIT_CAM_ENABLE	0	/* camera IO0 = power enable, active high */
+#define GPIO_BIT_RST_DEMOSAIC	2	/* active low */
+#define GPIO_BIT_RST_VPSS	3	/* active low (aresetn_ctrl) */
+#define GPIO_BIT_RST_GAMMA	4	/* active low */
+#define GPIO_BIT_RST_FRMBUF	6	/* active low */
+#define GPIO_DOUT_DEFAULT	0x00000001	/* camera on, every video IP in reset */
+#define GPIO_ACTIVE_HIGH	0
+#define GPIO_ACTIVE_LOW		1
+
+/* --- clocks of the AUBoard (one MMCM); fixed clocks for Linux ---------------- */
+#define CLK_AXI_HZ		100000000	/* clk_100M: AXI4-Lite of csi/iic/gpio/intc */
+#define CLK_DPHY_HZ		200000000	/* clk_200M: D-PHY reference */
+#define CLK_VIDEO_HZ		300000000	/* [A] clk_video ("video_clk_mhz" of bd_fpga.tcl) */
+#define CLK_SENSOR_HZ		24000000	/* oscillator on the camera module (INCK) */
+
+/* --- video IP configuration --------------------------------------------------- */
+#define VID_MAX_WIDTH		1920
+#define VID_MAX_HEIGHT		1232
+#define VID_DATA_WIDTH		8		/* bits per component after the 10->8 converter */
+#define VID_PPC			1		/* samples per clock */
+#define VPSS_TAPS		6		/* C_H_SCALER_TAPS = C_V_SCALER_TAPS (polyphase) */
+#define CSI_PXL_FORMAT		0x2b		/* RAW10 (CMN_PXL_FORMAT) */
+#define CSI_LANES		1 2
+#define SENSOR_LINK_FREQ	456000000	/* the only link frequency the imx219 driver accepts on 2 lanes */
+#define FRMBUF_ADDR_WIDTH	32		/* AXIMM_ADDR_WIDTH */
+#define FRMBUF_DMA_ALIGN	8		/* stride alignment in bytes (64-bit AXI4 master) */
+/* v_frmbuf_wr has HAS_RGB8 only. The Linux name of XVIDC RGB8 is "bgr888"
+ * (xilinx_frmbuf.c:399) = V4L2_PIX_FMT_RGB24 ("RGB3"). Add "rgb888" for HAS_BGR8,
+ * "yuyv" for HAS_YUYV8 ... the list MUST equal the formats enabled in the IP. */
+#define FRMBUF_VID_FORMATS	"bgr888"
+/* xlnx,video-format codes (include/dt-bindings/media/xilinx-vip.h) */
+#define XVIP_VF_RBG		2
+#define XVIP_VF_MONO_SENSOR	12
+
+/* ==========================================================================
+ * END OF CONSTANTS
+ * ========================================================================== */
+
+&amba_pl {
+#ifndef C2C_FLAT
+	/*
+	 * A bus node for "everything behind the link". It exists for ONE reason:
+	 * dma-ranges. The remote masters reach only 0 - 0x7FFF_FFFF, but no driver
+	 * says so: xilinx_frmbuf only uses xlnx,dma-addr-width to choose 32 or
+	 * 64-bit address REGISTER writes (xilinx_frmbuf.c:1627-1637) and sets no DMA
+	 * mask, and the device that really allocates the capture buffers, the
+	 * "xlnx,video" node, sets a 64-BIT mask (xilinx-vipp.c:815). The ZCU106 has
+	 * 2 GB of DDR at 0x8_0000_0000: a buffer from there would be truncated to 32
+	 * bits by the frame buffer writer and overwrite low memory.
+	 * dma-ranges makes of_dma_configure_id() set dev->bus_dma_limit = 0x7FFFFFFF
+	 * on every device below (drivers/of/device.c:117-148); the driver mask
+	 * cannot widen that, dma-direct then allocates with GFP_DMA / from the
+	 * default CMA area (both in DDR low on this board) and bounces or refuses
+	 * foreign (USERPTR / DMABUF) buffers above the limit instead of corrupting.
+	 *
+	 * compatible MUST be "simple-pm-bus", not "simple-bus": for a node added by
+	 * an overlay the platform bus creates the device of the node itself only
+	 * (of_platform_notify, drivers/of/platform.c:732-751); the children of a
+	 * new "simple-bus" would never be created, while the simple-pm-bus driver
+	 * calls of_platform_populate() in its probe (drivers/bus/simple-pm-bus.c:74).
+	 *
+	 * Build with -DC2C_FLAT (build-overlay.sh makes that variant too) to put the
+	 * nodes directly under amba_pl, without the bus node and without the DMA
+	 * limit - a fallback for debugging, not for shipping.
+	 */
+	c2c_bus: bus@C2C_WIN {
+		compatible = "simple-pm-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x0 HEX(C2C_WIN) 0x0 HEX(C2C_WIN) 0x0 C2C_WIN_SIZE>;
+		dma-ranges = <0x0 C2C_DMA_BASE 0x0 C2C_DMA_BASE 0x0 C2C_DMA_SIZE>;
+#endif
+
+		/* ---------------------------------------------------------------
+		 * Clocks. They are generated on the AUBoard, Linux cannot gate or
+		 * change them: fixed clocks. (A node added by an overlay is served
+		 * by the platform driver of clk-fixed-rate.c, not by CLK_OF_DECLARE.)
+		 * --------------------------------------------------------------- */
+		rmt_clk_axi: clk-rmt-axi {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <CLK_AXI_HZ>;
+			clock-output-names = "rmt_clk_100M";
+		};
+
+		rmt_clk_dphy: clk-rmt-dphy {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <CLK_DPHY_HZ>;
+			clock-output-names = "rmt_clk_200M";
+		};
+
+		rmt_clk_video: clk-rmt-video {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <CLK_VIDEO_HZ>;
+			clock-output-names = "rmt_clk_video";
+		};
+
+		/* 24 MHz oscillator of the Raspberry Pi camera v2 module. The imx219
+		 * driver refuses any other rate (imx219.c:1163-1166). */
+		imx219_clk: clk-imx219 {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <CLK_SENSOR_HZ>;
+			clock-output-names = "imx219_inck";
+		};
+
+		/* ---------------------------------------------------------------
+		 * Sensor supplies. The imx219 driver REQUIRES VANA / VDIG / VDDL
+		 * (imx219.c:255-260, devm_regulator_bulk_get). The rails are made on
+		 * the camera module from the 3.3 V of the FMC while camera IO0
+		 * (GPIO bit 0) is high; nothing to switch: dummy fixed regulators,
+		 * shared by both cameras, as in the rpi-camera-fmc reference design.
+		 * --------------------------------------------------------------- */
+		imx219_vana: regulator-imx219-vana {
+			compatible = "regulator-fixed";
+			regulator-name = "imx219_vana";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+		};
+
+		imx219_vdig: regulator-imx219-vdig {
+			compatible = "regulator-fixed";
+			regulator-name = "imx219_vdig";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		imx219_vddl: regulator-imx219-vddl {
+			compatible = "regulator-fixed";
+			regulator-name = "imx219_vddl";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+		};
+
+		/* ---------------------------------------------------------------
+		 * Remote interrupt controller, cascaded into GIC SPI 89.
+		 * This kernel has CONFIG_IRQCHIP_XILINX_INTC_MODULE_SUPPORT_EXPERIMENTAL=y,
+		 * so irq-xilinx-intc.c registers a PLATFORM DRIVER
+		 * (irq-xilinx-intc.c:346-348) instead of IRQCHIP_DECLARE (:354): a node
+		 * added by an overlay is probed like any other device.
+		 * The driver needs IVR, SIE and CIE in the IP (axi_intc defaults).
+		 * The second interrupt cell of the consumers is ignored by the driver
+		 * (edge/level comes from xlnx,kind-of-intr); 2 = "level high" is the
+		 * convention of the AMD device-tree generator.
+		 * --------------------------------------------------------------- */
+		rmt_intc: interrupt-controller@INTC_ADDR {
+			compatible = "xlnx,axi-intc-4.1", "xlnx,xps-intc-1.00.a";
+			reg = <0x0 HEX(INTC_ADDR) 0x0 SZ_64K>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&gic>;
+			interrupts = <0 C2C_GIC_SPI 4>;		/* SPI, level high */
+			xlnx,num-intr-inputs = <INTC_NUM_INPUTS>;	/* required */
+			xlnx,kind-of-intr = <INTC_KIND_OF_INTR>;
+			clocks = <&rmt_clk_axi>;
+			clock-names = "s_axi_aclk";
+		};
+
+		/* ===============================================================
+		 * CAM0
+		 * =============================================================== */
+
+		/*
+		 * Enable + resets. gpio-xilinx WRITES xlnx,dout-default to the data
+		 * register in probe (gpio-xilinx.c:589,652 xgpio_save_regs): it must
+		 * keep bit 0 = 1 (camera on). A missing property would write 0 and
+		 * switch the camera off.
+		 * A video IP in reset does NOT answer on AXI4-Lite and the access
+		 * never completes: each driver below takes its reset line from here,
+		 * asserts it (GPIOD_OUT_HIGH + GPIO_ACTIVE_LOW = pin low) and releases
+		 * it before its first register access. Never devmem a video IP whose
+		 * reset bit is 0.
+		 */
+		cam0_gpio: gpio@CAM0_GPIO_ADDR {
+			compatible = "xlnx,axi-gpio-2.0", "xlnx,xps-gpio-1.00.a";
+			reg = <0x0 HEX(CAM0_GPIO_ADDR) 0x0 SZ_64K>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			xlnx,gpio-width = <32>;
+			xlnx,is-dual = <0>;
+			xlnx,all-outputs = <1>;
+			xlnx,dout-default = <GPIO_DOUT_DEFAULT>;
+			xlnx,tri-default = <0x0>;
+			clocks = <&rmt_clk_axi>;
+			clock-names = "s_axi_aclk";
+			gpio-line-names = "cam0-enable", "cam0-io1", "cam0-rst-demosaic",
+					  "cam0-rst-vpss", "cam0-rst-gamma", "",
+					  "cam0-rst-frmbuf";
+		};
+
+		/* Sensor bus. i2c-xiic REQUIRES a clock and an interrupt
+		 * (i2c-xiic.c:1450,1468). No clock-frequency: the 100 kHz timing is
+		 * the one built into the IP for its 100 MHz clock. */
+		cam0_iic: i2c@CAM0_IIC_ADDR {
+			compatible = "xlnx,axi-iic-2.1", "xlnx,xps-iic-2.00.a";
+			reg = <0x0 HEX(CAM0_IIC_ADDR) 0x0 SZ_64K>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM0_IIC_IRQ 2>;
+			clocks = <&rmt_clk_axi>;
+			clock-names = "s_axi_aclk";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/*
+			 * No reset-gpios on purpose. The imx219 driver would treat it
+			 * as the enable pin (1 = on in power_on, imx219.c:1004; flags
+			 * would be GPIO_ACTIVE_HIGH on GPIO bit 0) and only waits 6.2 ms
+			 * after raising it, not enough for the regulators of the module.
+			 * The camera stays enabled from the reset value of the GPIO, as
+			 * in the reference design.
+			 *
+			 * OPEN: 0x10 is the IMX219 address of the reference design. On
+			 * this hardware both sensors still answered NACK at 0x10 over
+			 * JTAG when this file was written (README.md, "Open values").
+			 * If the address changes, change sensor@10 AND reg, CAM0 + CAM2.
+			 */
+			imx219_cam0: sensor@10 {
+				compatible = "sony,imx219";
+				reg = <0x10>;
+				clocks = <&imx219_clk>;
+				VANA-supply = <&imx219_vana>;	/* 2.8 V */
+				VDIG-supply = <&imx219_vdig>;	/* 1.8 V */
+				VDDL-supply = <&imx219_vddl>;	/* 1.2 V */
+
+				port {
+					imx219_cam0_out: endpoint {
+						remote-endpoint = <&cam0_csi_in>;
+						data-lanes = <CSI_LANES>;
+						link-frequencies = /bits/ 64 <SENSOR_LINK_FREQ>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * MIPI CSI-2 RX subsystem. Required by xilinx-csi2rxss.c: interrupt
+		 * (:1011), clocks "lite_aclk" + "video_aclk" (:245-248),
+		 * xlnx,csi-pxl-format (:894), xlnx,vfb (:932), port@0 with data-lanes,
+		 * port@1. The driver keeps ONE format for both pads and accepts the
+		 * data type of the IP (RAW10) or RAW8 (:790-797); it does not read
+		 * xlnx,video-format / -width / cfa-pattern of the ports - they are kept
+		 * as in the generated trees of the reference design, for information.
+		 * Not set: xlnx,en-active-lanes (C_CSI_EN_ACTIVELANES is false; the
+		 * driver only prints it), xlnx,en-csi-v2-0 / xlnx,en-vcx (booleans by
+		 * PRESENCE; VCX is off in the IP).
+		 */
+		cam0_csi: mipi_csi2_rx_subsystem@CAM0_CSI_ADDR {
+			compatible = "xlnx,mipi-csi2-rx-subsystem-6.0",
+				     "xlnx,mipi-csi2-rx-subsystem-5.0";
+			reg = <0x0 HEX(CAM0_CSI_ADDR) 0x0 SZ_64K>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM0_CSI_IRQ 2>;
+			clocks = <&rmt_clk_dphy>, <&rmt_clk_axi>, <&rmt_clk_video>;
+			clock-names = "dphy_clk_200M", "lite_aclk", "video_aclk";
+			xlnx,csi-pxl-format = <CSI_PXL_FORMAT>;
+			xlnx,vfb;
+			xlnx,max-lanes = <2>;
+			xlnx,ppc = <VID_PPC>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-format = <XVIP_VF_MONO_SENSOR>;
+					xlnx,video-width = <10>;
+					xlnx,cfa-pattern = "rggb";
+					cam0_csi_in: endpoint {
+						remote-endpoint = <&imx219_cam0_out>;
+						data-lanes = <CSI_LANES>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-format = <XVIP_VF_MONO_SENSOR>;
+					xlnx,video-width = <10>;
+					xlnx,cfa-pattern = "rggb";
+					cam0_csi_out: endpoint {
+						remote-endpoint = <&cam0_demosaic_in>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * Demosaic. The axis_subset_converter in front of it (RAW10 -> the 8
+		 * MSB) has no registers and no node: the sink pad of the driver takes
+		 * SRGGB8/10/12/16 alike (xilinx-demosaic.c:152-184) and only the Bayer
+		 * phase is programmed, so SRGGB10_1X10 of the CSI source pad validates
+		 * against this sink pad. Required: xlnx,max-width/-height (u32),
+		 * one clock, reset-gpios (:316). No interrupt is used.
+		 */
+		cam0_demosaic: v_demosaic@CAM0_DEMOSAIC_ADDR {
+			compatible = "xlnx,v-demosaic-1.1", "xlnx,v-demosaic";
+			reg = <0x0 HEX(CAM0_DEMOSAIC_ADDR) 0x0 SZ_64K>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam0_gpio GPIO_BIT_RST_DEMOSAIC GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					xlnx,cfa-pattern = "rggb";
+					cam0_demosaic_in: endpoint {
+						remote-endpoint = <&cam0_csi_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam0_demosaic_out: endpoint {
+						remote-endpoint = <&cam0_gamma_in>;
+					};
+				};
+			};
+		};
+
+		/* Gamma LUT. As demosaic, plus xlnx,video-width (8 or 10) in EVERY
+		 * port (xilinx-gamma.c:415-431). Pads: RBG888_1X24 only. */
+		cam0_gamma: v_gamma_lut@CAM0_GAMMA_ADDR {
+			compatible = "xlnx,v-gamma-lut-1.1", "xlnx,v-gamma-lut";
+			reg = <0x0 HEX(CAM0_GAMMA_ADDR) 0x0 SZ_64K>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam0_gpio GPIO_BIT_RST_GAMMA GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam0_gamma_in: endpoint {
+						remote-endpoint = <&cam0_demosaic_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam0_gamma_out: endpoint {
+						remote-endpoint = <&cam0_vpss_in>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * Video Processing Subsystem, scaler only. The compatible must be the
+		 * one of the SCALER driver and nothing else. reg = the BASE of the
+		 * 256K v_proc_ss range: the driver adds +0x0_0000 h scaler, +0x1_0000
+		 * reset GPIO, +0x2_0000 v scaler itself (xilinx-vpss-scaler.c:38-40).
+		 * Required for -2.2: clocks "aclk_axis" + "aclk_ctrl" (:1863-1872),
+		 * max-width/-height, num-hori-taps / num-vert-taps (6,8,10,12 =
+		 * polyphase), pix-per-clk, reset-gpios (:2001), and a valid
+		 * xlnx,video-format + xlnx,video-width in every port (:1912).
+		 * The IP has no colour conversion and RGB / YUV 4:4:4 only: RGB in,
+		 * RGB out (RBG888_1X24 on both pads), scaling only.
+		 */
+		cam0_vpss: v_proc_ss@CAM0_VPSS_ADDR {
+			compatible = "xlnx,v-vpss-scaler-2.2";
+			reg = <0x0 HEX(CAM0_VPSS_ADDR) 0x0 SZ_256K>;
+			clocks = <&rmt_clk_video>, <&rmt_clk_video>;
+			clock-names = "aclk_axis", "aclk_ctrl";
+			reset-gpios = <&cam0_gpio GPIO_BIT_RST_VPSS GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+			xlnx,num-hori-taps = <VPSS_TAPS>;
+			xlnx,num-vert-taps = <VPSS_TAPS>;
+			xlnx,pix-per-clk = <VID_PPC>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-format = <XVIP_VF_RBG>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam0_vpss_in: endpoint {
+						remote-endpoint = <&cam0_gamma_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-format = <XVIP_VF_RBG>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam0_vpss_out: endpoint {
+						remote-endpoint = <&cam0_vcap_in>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * Frame Buffer Write = the dmaengine of the capture node. Required
+		 * (xilinx_frmbuf.c): clock "ap_clk" (:1708), reset-gpios (:1718),
+		 * interrupt (:1646, the only IRQF_SHARED one of the chain),
+		 * xlnx,dma-addr-width 32|64 (:1627), max-width/-height,
+		 * xlnx,pixels-per-clock, xlnx,vid-formats, #dma-cells = <1>.
+		 * The second compatible is the one the driver matches (its own 3.0
+		 * string is spelled "xlnx,v-frmbuf-wr-v3.0").
+		 */
+		cam0_frmbuf: v_frmbuf_wr@CAM0_FRMBUF_ADDR {
+			compatible = "xlnx,v-frmbuf-wr-3.0", "xlnx,axi-frmbuf-wr-v2.2";
+			reg = <0x0 HEX(CAM0_FRMBUF_ADDR) 0x0 SZ_64K>;
+			#dma-cells = <1>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM0_FRMBUF_IRQ 2>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam0_gpio GPIO_BIT_RST_FRMBUF GPIO_ACTIVE_LOW>;
+			xlnx,dma-addr-width = <FRMBUF_ADDR_WIDTH>;
+			xlnx,dma-align = <FRMBUF_DMA_ALIGN>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+			xlnx,pixels-per-clock = <VID_PPC>;
+			xlnx,video-width = <VID_DATA_WIDTH>;
+			xlnx,vid-formats = FRMBUF_VID_FORMATS;
+		};
+
+		/*
+		 * The capture node: creates /dev/videoN and the media device, and IS
+		 * the device the capture buffers are allocated for (see c2c_bus).
+		 * Keep the name vcap_mipi_<CAM>_v_proc: the scripts find the camera
+		 * number in it. port@0 needs reg (it is the DMA index) and direction.
+		 */
+		vcap_mipi_0_v_proc {
+			compatible = "xlnx,video";
+			dmas = <&cam0_frmbuf 0>;
+			dma-names = "port0";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					direction = "input";
+					cam0_vcap_in: endpoint {
+						remote-endpoint = <&cam0_vpss_out>;
+					};
+				};
+			};
+		};
+
+		/* ===============================================================
+		 * CAM2 - identical to CAM0 (see the comments there)
+		 * =============================================================== */
+
+		cam2_gpio: gpio@CAM2_GPIO_ADDR {
+			compatible = "xlnx,axi-gpio-2.0", "xlnx,xps-gpio-1.00.a";
+			reg = <0x0 HEX(CAM2_GPIO_ADDR) 0x0 SZ_64K>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			xlnx,gpio-width = <32>;
+			xlnx,is-dual = <0>;
+			xlnx,all-outputs = <1>;
+			xlnx,dout-default = <GPIO_DOUT_DEFAULT>;
+			xlnx,tri-default = <0x0>;
+			clocks = <&rmt_clk_axi>;
+			clock-names = "s_axi_aclk";
+			gpio-line-names = "cam2-enable", "cam2-io1", "cam2-rst-demosaic",
+					  "cam2-rst-vpss", "cam2-rst-gamma", "",
+					  "cam2-rst-frmbuf";
+		};
+
+		cam2_iic: i2c@CAM2_IIC_ADDR {
+			compatible = "xlnx,axi-iic-2.1", "xlnx,xps-iic-2.00.a";
+			reg = <0x0 HEX(CAM2_IIC_ADDR) 0x0 SZ_64K>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM2_IIC_IRQ 2>;
+			clocks = <&rmt_clk_axi>;
+			clock-names = "s_axi_aclk";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			imx219_cam2: sensor@10 {
+				compatible = "sony,imx219";
+				reg = <0x10>;
+				clocks = <&imx219_clk>;
+				VANA-supply = <&imx219_vana>;	/* 2.8 V */
+				VDIG-supply = <&imx219_vdig>;	/* 1.8 V */
+				VDDL-supply = <&imx219_vddl>;	/* 1.2 V */
+
+				port {
+					imx219_cam2_out: endpoint {
+						remote-endpoint = <&cam2_csi_in>;
+						data-lanes = <CSI_LANES>;
+						link-frequencies = /bits/ 64 <SENSOR_LINK_FREQ>;
+					};
+				};
+			};
+		};
+
+		cam2_csi: mipi_csi2_rx_subsystem@CAM2_CSI_ADDR {
+			compatible = "xlnx,mipi-csi2-rx-subsystem-6.0",
+				     "xlnx,mipi-csi2-rx-subsystem-5.0";
+			reg = <0x0 HEX(CAM2_CSI_ADDR) 0x0 SZ_64K>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM2_CSI_IRQ 2>;
+			clocks = <&rmt_clk_dphy>, <&rmt_clk_axi>, <&rmt_clk_video>;
+			clock-names = "dphy_clk_200M", "lite_aclk", "video_aclk";
+			xlnx,csi-pxl-format = <CSI_PXL_FORMAT>;
+			xlnx,vfb;
+			xlnx,max-lanes = <2>;
+			xlnx,ppc = <VID_PPC>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-format = <XVIP_VF_MONO_SENSOR>;
+					xlnx,video-width = <10>;
+					xlnx,cfa-pattern = "rggb";
+					cam2_csi_in: endpoint {
+						remote-endpoint = <&imx219_cam2_out>;
+						data-lanes = <CSI_LANES>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-format = <XVIP_VF_MONO_SENSOR>;
+					xlnx,video-width = <10>;
+					xlnx,cfa-pattern = "rggb";
+					cam2_csi_out: endpoint {
+						remote-endpoint = <&cam2_demosaic_in>;
+					};
+				};
+			};
+		};
+
+		cam2_demosaic: v_demosaic@CAM2_DEMOSAIC_ADDR {
+			compatible = "xlnx,v-demosaic-1.1", "xlnx,v-demosaic";
+			reg = <0x0 HEX(CAM2_DEMOSAIC_ADDR) 0x0 SZ_64K>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam2_gpio GPIO_BIT_RST_DEMOSAIC GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					xlnx,cfa-pattern = "rggb";
+					cam2_demosaic_in: endpoint {
+						remote-endpoint = <&cam2_csi_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam2_demosaic_out: endpoint {
+						remote-endpoint = <&cam2_gamma_in>;
+					};
+				};
+			};
+		};
+
+		cam2_gamma: v_gamma_lut@CAM2_GAMMA_ADDR {
+			compatible = "xlnx,v-gamma-lut-1.1", "xlnx,v-gamma-lut";
+			reg = <0x0 HEX(CAM2_GAMMA_ADDR) 0x0 SZ_64K>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam2_gpio GPIO_BIT_RST_GAMMA GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam2_gamma_in: endpoint {
+						remote-endpoint = <&cam2_demosaic_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam2_gamma_out: endpoint {
+						remote-endpoint = <&cam2_vpss_in>;
+					};
+				};
+			};
+		};
+
+		cam2_vpss: v_proc_ss@CAM2_VPSS_ADDR {
+			compatible = "xlnx,v-vpss-scaler-2.2";
+			reg = <0x0 HEX(CAM2_VPSS_ADDR) 0x0 SZ_256K>;
+			clocks = <&rmt_clk_video>, <&rmt_clk_video>;
+			clock-names = "aclk_axis", "aclk_ctrl";
+			reset-gpios = <&cam2_gpio GPIO_BIT_RST_VPSS GPIO_ACTIVE_LOW>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+			xlnx,num-hori-taps = <VPSS_TAPS>;
+			xlnx,num-vert-taps = <VPSS_TAPS>;
+			xlnx,pix-per-clk = <VID_PPC>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					xlnx,video-format = <XVIP_VF_RBG>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam2_vpss_in: endpoint {
+						remote-endpoint = <&cam2_gamma_out>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					xlnx,video-format = <XVIP_VF_RBG>;
+					xlnx,video-width = <VID_DATA_WIDTH>;
+					cam2_vpss_out: endpoint {
+						remote-endpoint = <&cam2_vcap_in>;
+					};
+				};
+			};
+		};
+
+		cam2_frmbuf: v_frmbuf_wr@CAM2_FRMBUF_ADDR {
+			compatible = "xlnx,v-frmbuf-wr-3.0", "xlnx,axi-frmbuf-wr-v2.2";
+			reg = <0x0 HEX(CAM2_FRMBUF_ADDR) 0x0 SZ_64K>;
+			#dma-cells = <1>;
+			interrupt-parent = <&rmt_intc>;
+			interrupts = <CAM2_FRMBUF_IRQ 2>;
+			clocks = <&rmt_clk_video>;
+			clock-names = "ap_clk";
+			reset-gpios = <&cam2_gpio GPIO_BIT_RST_FRMBUF GPIO_ACTIVE_LOW>;
+			xlnx,dma-addr-width = <FRMBUF_ADDR_WIDTH>;
+			xlnx,dma-align = <FRMBUF_DMA_ALIGN>;
+			xlnx,max-width = <VID_MAX_WIDTH>;
+			xlnx,max-height = <VID_MAX_HEIGHT>;
+			xlnx,pixels-per-clock = <VID_PPC>;
+			xlnx,video-width = <VID_DATA_WIDTH>;
+			xlnx,vid-formats = FRMBUF_VID_FORMATS;
+		};
+
+		vcap_mipi_2_v_proc {
+			compatible = "xlnx,video";
+			dmas = <&cam2_frmbuf 0>;
+			dma-names = "port0";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					direction = "input";
+					cam2_vcap_in: endpoint {
+						remote-endpoint = <&cam2_vpss_out>;
+					};
+				};
+			};
+		};
+#ifndef C2C_FLAT
+	};
+#endif
+};

@@ -1,0 +1,67 @@
+# /etc/default/c2c-cameras - configuration of c2c-cameras.service, the automatic
+# bring-up of the two MIPI camera pipelines on the AUBoard 15P.
+#
+# Sourced as POSIX sh by /usr/bin/c2c-cameras, both from the service and when it
+# is run by hand. Change a value and re-run "systemctl restart c2c-cameras".
+#
+# THE RETRY IS ALWAYS "restart". "systemctl start c2c-cameras" is a no-op while
+# the unit is active, which is exactly the state it is in after a successful
+# boot - and exactly the case where a retry is most tempting (the AUBoard was
+# power-cycled while this board kept running). Nothing the service does is
+# repeated by a restart: the overlay is applied at most once per boot.
+#
+# Before capturing, scripts should check "c2c-cameras health" (read-only, one
+# line). Exit 5 means the AUBoard was reset behind the drivers' back and only a
+# reboot clears it; capturing in that state hangs the CPU.
+
+# Master switch. 0 makes the service do nothing and succeed.
+C2C_CAMERAS_ENABLE=1
+
+# How long to wait at boot for the AXI Chip2Chip link to train, in seconds. The
+# link needs a couple of seconds once both bitstreams are live; the default
+# leaves room for an AUBoard that is powered on at the same time as this board.
+# Nothing else waits for this unit, so a long timeout does not hold up the boot.
+C2C_LINK_TIMEOUT=60
+
+# How long to wait for /dev/media* and /dev/video* after the overlay is applied.
+C2C_DEV_TIMEOUT=30
+
+# Sensor mode. The IMX219 offers 1920x1080 (default), 1640x1232 (2x2 binned,
+# full field of view) and 640x480. 3280x2464 does NOT fit the video IP
+# (max 1920x1232).
+C2C_CAM_WIDTH=1920
+C2C_CAM_HEIGHT=1080
+
+# Size after the v_proc_ss scaler. Defaults to the sensor mode, i.e. no scaling.
+# At most 1920x1232. The capture pixel format is always RGB3 (RGB24): the
+# scaler has no colour-space conversion and v_frmbuf_wr has RGB8 only.
+#C2C_CAM_OUT_WIDTH=1280
+#C2C_CAM_OUT_HEIGHT=720
+
+# Controls applied to every capture node after the pipelines are configured, as
+# one v4l2-ctl --set-ctrl argument. The pipeline has no auto-exposure and no
+# white balance and the gamma LUT powers up at 1.0 (linear light), so without
+# this the first picture out of a fresh boot is dark and green-cast. The value
+# of each gamma control is the exponent x10 (10 = 1.0 = linear); 5 is roughly
+# the sRGB display encode, and green gets 6 because green has twice as many
+# Bayer samples. Set to "" to leave every control at its driver default.
+C2C_CAM_CTRLS="red_gamma_correction_1_0_1_10=5,green_gamma_correction_1_0_1_1=6,blue_gamma_correction_1_0_1_10=5"
+
+# Check that the AUBoard really runs the camera design before applying the
+# overlay (read-only probe of two registers that exist only in that design).
+# Leave at 1: with it off, an AUBoard running another bitstream makes every
+# driver probe an address that is not mapped.
+C2C_PROBE=1
+
+# What to report when the link never comes up.
+#   1 (default) exit non-zero, so the unit is marked failed. The state is then
+#     visible in "systemctl status c2c-cameras" and a plain
+#     "systemctl start c2c-cameras" retries once the AUBoard is up.
+#   0 exit 0, so a ZCU106 used on its own boots with a green unit. The retry is
+#     then "systemctl restart c2c-cameras" or "c2c-cameras start".
+# Either way the board boots and runs normally.
+C2C_NOLINK_STATUS=1
+
+# The overlay blob and the configfs name it is applied under.
+#C2C_OVERLAY_FILE=/lib/firmware/c2c/c2c-cams.dtbo
+#C2C_OVERLAY_NAME=cams

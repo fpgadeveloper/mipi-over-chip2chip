@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# Optional automatic start of the DisplayPort output of the two camera streams.
+# See /usr/bin/c2c-display and /etc/default/c2c-display.
+#
+# This unit is shipped DISABLED and, even when enabled, does nothing unless
+# C2C_DISPLAY_ENABLE=1 in /etc/default/c2c-display. The default boot of this
+# image is therefore "cameras ready, display idle": c2c-cameras.service brings
+# the pipelines up and nothing drives the monitor until somebody asks for it.
+
+[Unit]
+Description=DisplayPort output of the remote MIPI cameras
+Documentation=https://github.com/fpgadeveloper/mipi-over-chip2chip
+# The cameras have to be up first: this reads their capture devices and, for a
+# windowed layout, re-runs c2c-init-cams to change the remote scaler output.
+Requires=c2c-cameras.service
+After=c2c-cameras.service
+# Stopping or restarting the cameras takes the display with it. That matters at
+# shutdown: c2c-cameras stop halts the remote frame buffer writers, and GStreamer
+# must not still be pulling frames from them when it does.
+PartOf=c2c-cameras.service
+ConditionPathExists=/usr/bin/c2c-display
+
+[Service]
+Type=simple
+# "start" is the service entry point: it honours C2C_DISPLAY_ENABLE and
+# C2C_DISPLAY_MODE and exits 0 doing nothing when the display is not enabled.
+ExecStart=/usr/bin/c2c-display start
+ExecStop=/usr/bin/c2c-display off
+# GStreamer runs in the foreground for as long as the display is up. If it dies
+# (monitor unplugged, a camera stops delivering) bring it back, but slowly
+# enough that a permanent fault does not spin.
+Restart=on-failure
+RestartSec=10
+# Exit 5 is "the AUBoard was reset behind the drivers' back", which c2c-display
+# gets from c2c-cameras health and passes on. Only a reboot clears it, so
+# retrying every 10 s until the end of time is pointless noise: stop instead and
+# leave the unit failed, where the reason is visible.
+RestartPreventExitStatus=5
+
+[Install]
+WantedBy=multi-user.target

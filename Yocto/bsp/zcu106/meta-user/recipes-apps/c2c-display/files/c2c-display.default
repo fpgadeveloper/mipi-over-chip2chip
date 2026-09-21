@@ -1,0 +1,38 @@
+# /etc/default/c2c-display - configuration of c2c-display.service, the optional
+# automatic start of the DisplayPort output of the two camera streams.
+#
+# Sourced as POSIX sh by /usr/bin/c2c-display, both from the service and when it
+# is run by hand. /etc/default/c2c-cameras is sourced first, so the sensor mode
+# and the picture controls come from there and are not repeated here.
+#
+# Running c2c-display by hand ("c2c-display both", "c2c-display cam0") ignores
+# C2C_DISPLAY_ENABLE and C2C_DISPLAY_MODE; they only steer the service.
+
+# Master switch for the service. 0 (default) makes it do nothing and succeed, so
+# a board boots with the cameras ready and the monitor idle. To start the
+# display at every boot:
+#     sed -i 's/^C2C_DISPLAY_ENABLE=.*/C2C_DISPLAY_ENABLE=1/' /etc/default/c2c-display
+#     systemctl enable --now c2c-display
+# BOTH are needed: the unit is shipped disabled as well.
+C2C_DISPLAY_ENABLE=0
+
+# What the service shows: both (side by side), cam0 or cam2 (full screen).
+C2C_DISPLAY_MODE=both
+
+# Size of ONE camera window, for "both". Two of these sit side by side on the
+# 1920x1080 output, so 960x540 fills the width exactly.
+#
+# The video mixer's layers can only UPSCALE, so the picture has to leave the
+# AUBoard at this size: c2c-display re-runs c2c-init-cams to set the remote
+# scaler accordingly, and re-applies C2C_CAM_CTRLS afterwards. That changes what
+# c2c-cameras.service configured at boot (1920x1080 by default) - deliberately,
+# and only while the display is in use. "systemctl restart c2c-cameras" puts the
+# pipelines back to the service's own size.
+#
+# A single camera (cam0 / cam2) uses the full 1920x1080 instead, unless -w / -H
+# are given on the command line.
+C2C_DISPLAY_WIN_W=960
+C2C_DISPLAY_WIN_H=540
+
+# Frame rate requested from the capture devices.
+C2C_DISPLAY_FPS=30

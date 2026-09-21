@@ -1,0 +1,73 @@
+{
+  "bd_name": "c2c",
+  "prj_name": "mipi-over-chip2chip",
+  "groups": [
+    {
+      "label": "fpga",
+      "name": "FPGA"
+    },
+    {
+      "label": "z7",
+      "name": "Zynq-7000"
+    },
+    {
+      "label": "zu",
+      "name": "Zynq UltraScale+"
+    },
+    {
+      "label": "versal",
+      "name": "Versal"
+    }
+  ],
+  "designs": [
+    {
+      "publish": true,
+      "label": "zcu106",
+      "role": "host",
+      "board": "ZCU106",
+      "link": "https://www.xilinx.com/zcu106",
+      "url": "xilinx.com",
+      "boardname": "zcu106",
+      "cams": [
+        0,
+        2
+      ],
+      "vcu": false,
+      "accel": false,
+      "cfg": "prj_config",
+      "connector": "SFP0",
+      "group": "zu",
+      "petalinux": false,
+      "yocto": true,
+      "baremetal": true,
+      "license": false,
+      "flashsize": "0",
+      "flashintf": "0"
+    },
+    {
+      "publish": true,
+      "label": "auboard",
+      "role": "mezzanine",
+      "board": "AUBoard 15P",
+      "link": "https://www.avnet.com/americas/products/avnet-boards/avnet-board-families/auboard-15p-fpga-development-kit/",
+      "url": "avnet-tria",
+      "boardname": "auboard_15p",
+      "cams": [
+        0,
+        2
+      ],
+      "vcu": false,
+      "accel": false,
+      "cfg": "prj_config",
+      "connector": "HPC",
+      "group": "fpga",
+      "petalinux": false,
+      "yocto": false,
+      "baremetal": false,
+      "cfgmem": true,
+      "license": false,
+      "flashsize": "0",
+      "flashintf": "0"
+    }
+  ]
+}

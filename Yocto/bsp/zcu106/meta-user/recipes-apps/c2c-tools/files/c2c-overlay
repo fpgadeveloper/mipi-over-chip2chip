@@ -1,0 +1,140 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# c2c-overlay - apply the device-tree nodes of the peripherals behind the AXI
+# Chip2Chip link as a run-time overlay (configfs), but only once the link is up.
+#
+# The drivers of those peripherals are built into the kernel and probe the moment
+# their nodes appear; a probe touches the remote registers, and with the link
+# down that access never completes. Hence the link check before the overlay.
+
+. /usr/share/c2c-tools/c2c-functions.sh
+
+CFS=${C2C_CONFIGFS:-/sys/kernel/config}
+OVL=$CFS/device-tree/overlays
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} [-f] apply NAME FILE
+       ${0##*/} remove NAME
+       ${0##*/} list
+  apply   load FILE as overlay NAME. FILE is a compiled overlay (.dtbo), or an
+          overlay source (.dts / .dtso) which is compiled with "dtc -@" first.
+  remove  unload overlay NAME. Best effort: not every driver unbinds cleanly;
+          reboot when in doubt.
+  list    show the loaded overlays and their state
+  -f      force: apply even though the link is down
+Exit status: 0 done, 1 refused (link down) or the kernel rejected the overlay,
+             2 error
+EOF
+}
+
+force=0
+while getopts fh opt; do
+	case $opt in
+	f) force=1 ;;
+	h)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+shift $((OPTIND - 1))
+
+cmd=${1:-}
+[ -n "$cmd" ] || {
+	usage >&2
+	exit 2
+}
+shift
+
+check_name() {
+	case "$1" in
+	'' | *[!A-Za-z0-9_.-]*) c2c_die "bad overlay name: '$1'" ;;
+	esac
+}
+
+need_configfs() {
+	[ -d "$OVL" ] && return 0
+	mount -t configfs configfs "$CFS" 2>/dev/null
+	[ -d "$OVL" ] || c2c_die "$OVL not found (CONFIG_OF_CONFIGFS missing?)"
+}
+
+case $cmd in
+apply)
+	[ $# -eq 2 ] || {
+		usage >&2
+		exit 2
+	}
+	name=$1
+	file=$2
+	check_name "$name"
+	[ -r "$file" ] || c2c_die "cannot read $file"
+	c2c_need_root
+	need_configfs
+	[ ! -e "$OVL/$name" ] || c2c_die "overlay '$name' is already loaded"
+
+	if [ "$force" -ne 1 ]; then
+		c2c_link_up
+		case $? in
+		0) ;;
+		1)
+			echo "${0##*/}: the Chip2Chip link is DOWN (status $C2C_STATUS);" \
+				"not applying '$name'. Use -f to override." >&2
+			exit 1
+			;;
+		*) c2c_die "cannot read the link status at $C2C_STATUS_ADDR" ;;
+		esac
+	fi
+
+	case "$file" in
+	*.dts | *.dtso)
+		command -v dtc >/dev/null 2>&1 || c2c_die "dtc is not installed"
+		dtbo=${TMPDIR:-/run}/c2c-overlay-$name.dtbo
+		# -q: an overlay cannot see the #address-cells of its target bus, so
+		# dtc warns about every reg property; errors are still reported.
+		dtc -q -@ -I dts -O dtb -o "$dtbo" "$file" || c2c_die "dtc failed on $file"
+		;;
+	*) dtbo=$file ;;
+	esac
+
+	mkdir "$OVL/$name" || c2c_die "cannot create $OVL/$name"
+	cat "$dtbo" >"$OVL/$name/dtbo"
+	state=$(cat "$OVL/$name/status" 2>/dev/null)
+	if [ "$state" != applied ]; then
+		rmdir "$OVL/$name" 2>/dev/null
+		echo "${0##*/}: the kernel rejected '$name' (state: ${state:-unknown});" \
+			"see dmesg" >&2
+		exit 1
+	fi
+	echo "overlay '$name' applied"
+	;;
+remove)
+	[ $# -eq 1 ] || {
+		usage >&2
+		exit 2
+	}
+	check_name "$1"
+	c2c_need_root
+	need_configfs
+	[ -d "$OVL/$1" ] || c2c_die "overlay '$1' is not loaded"
+	rmdir "$OVL/$1" || c2c_die "cannot remove overlay '$1'"
+	echo "overlay '$1' removed"
+	;;
+list)
+	need_configfs
+	for d in "$OVL"/*; do
+		[ -d "$d" ] || continue
+		printf '%-24s %s\n' "${d##*/}" "$(cat "$d/status" 2>/dev/null)"
+	done
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac

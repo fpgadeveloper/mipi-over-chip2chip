@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Opsero Electronic Design Inc.  All rights reserved.
+#
+# Stable names for the two remote MIPI camera pipelines on the AUBoard 15P.
+#
+# WHY: the /dev/videoN and /dev/mediaN numbers are probe order, and the two
+# pipelines probe in whatever order their drivers finish. Measured across
+# consecutive boots of the same image on the same hardware, CAM0 was
+# /dev/video0 on some boots and /dev/video1 on others; the sensors' I2C bus
+# numbers move with it, so "imx219 3-0010" is not an identifier either.
+#
+# WHAT IS STABLE: the platform device each node hangs off. The capture node and
+# the media device of a pipeline are both children of
+# "amba_pl:bus@a0000000:vcap_mipi_<N>_v_proc", and every other subdevice is a
+# child of a platform device named after its register address
+# (a01xxxxx = CAM0, a02xxxxx = CAM2). Neither moves. KERNELS== walks the parent
+# chain, so one key serves both subsystems.
+#
+# RESULT: /dev/video-cam0, /dev/video-cam2, /dev/media-cam0, /dev/media-cam2 and
+# a v4l-subdev-cam<N>-<stage> link per pipeline stage. Use these everywhere
+# instead of a number; c2c-display and c2c-init-cams do.
+#
+# NOTE for scripts: /dev/video-cam0 also matches the glob /dev/video*, so any
+# loop over capture nodes must use /dev/video[0-9]* (and /dev/media[0-9]*) or it
+# will see each camera twice.
+
+# ---------------------------------------------------------------------------
+# Capture nodes and media devices, keyed on the pipeline's capture platform
+# device.
+# ---------------------------------------------------------------------------
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", KERNELS=="*:vcap_mipi_0_v_proc", SYMLINK+="video-cam0"
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", KERNELS=="*:vcap_mipi_2_v_proc", SYMLINK+="video-cam2"
+SUBSYSTEM=="media", KERNEL=="media[0-9]*", KERNELS=="*:vcap_mipi_0_v_proc", SYMLINK+="media-cam0"
+SUBSYSTEM=="media", KERNEL=="media[0-9]*", KERNELS=="*:vcap_mipi_2_v_proc", SYMLINK+="media-cam2"
+
+# ---------------------------------------------------------------------------
+# Sub-devices, keyed on the register address of the IP they belong to.
+# CAM0 = 0xA01x_xxxx, CAM2 = 0xA02x_xxxx. The sensor hangs off the pipeline's
+# own I2C controller, which is what makes it identifiable when the I2C bus
+# number moves.
+# ---------------------------------------------------------------------------
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0110000.i2c", SYMLINK+="v4l-subdev-cam0-sensor"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0100000.mipi_csi2_rx_subsystem", SYMLINK+="v4l-subdev-cam0-csi"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0130000.v_demosaic", SYMLINK+="v4l-subdev-cam0-demosaic"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0140000.v_gamma_lut", SYMLINK+="v4l-subdev-cam0-gamma"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0180000.v_proc_ss", SYMLINK+="v4l-subdev-cam0-scaler"
+
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0210000.i2c", SYMLINK+="v4l-subdev-cam2-sensor"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0200000.mipi_csi2_rx_subsystem", SYMLINK+="v4l-subdev-cam2-csi"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0230000.v_demosaic", SYMLINK+="v4l-subdev-cam2-demosaic"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0240000.v_gamma_lut", SYMLINK+="v4l-subdev-cam2-gamma"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", KERNELS=="a0280000.v_proc_ss", SYMLINK+="v4l-subdev-cam2-scaler"
