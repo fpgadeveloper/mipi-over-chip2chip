@@ -1,9 +1,10 @@
 # Documentation for the reference design
 
-This folder contains the sources of the documentation of the MIPI over Chip2Chip reference
-design. The documentation is a work in progress and has not been published yet. We strongly
-encourage you to contribute: you can modify these sources and then make a pull request to
-this repository on Github.
+The documentation of the MIPI over Chip2Chip reference design is hosted at
+[mipi-over-chip2chip.camerafmc.com](https://mipi-over-chip2chip.camerafmc.com/en/latest/)
+and it is best viewed from there. This folder of the repo contains the sources of the
+documentation, and we strongly encourage you to contribute: you can modify these sources and
+then make a pull request to this repository on Github.
 
 ## How to build the docs locally
 

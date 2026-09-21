@@ -31,7 +31,10 @@ halves of one system, and both must be built.
 | Host      | `zcu106`      | AMD [ZCU106] (Zynq UltraScale+) | Runs Linux (AMD EDF / Yocto). Controls the remote video pipelines and receives the frames in its DDR memory. |
 | Mezzanine | `auboard`     | Tria [AUBoard 15P] (Artix UltraScale+, no processor) | Carries the Opsero [RPi Camera FMC] (OP068) with two Raspberry Pi cameras, and holds the MIPI CSI-2 video pipelines. |
 
+![MIPI over Chip2Chip setup: ZCU106 and AUBoard 15P with the RPi Camera FMC, both camera streams on a DisplayPort monitor](docs/source/images/setup.webp "MIPI over Chip2Chip setup")
+
 Important links:
+* The [documentation](https://mipi-over-chip2chip.camerafmc.com/en/latest/) of this reference design
 * The RPi Camera FMC [datasheet](https://docs.opsero.com/op068/datasheet/overview/)
 * To [report an issue](https://github.com/fpgadeveloper/mipi-over-chip2chip/issues)
 * For technical support: [Contact Opsero](https://opsero.com/contact-us)
@@ -80,13 +83,13 @@ Important links:
 
 Measured on hardware: both cameras stream 1920x1080 RGB24 at the sensor's maximum
 47.57 frames/s at the same time — **591.8 MB/s through the link, with no dropped frames**.
-See [Using the cameras from Linux](docs/source/linux_cameras.md).
+See [Using the cameras from Linux](https://mipi-over-chip2chip.camerafmc.com/en/latest/linux_cameras.html).
 
 The host image brings the two remote cameras up **by itself at boot** and can put them side
 by side on a monitor plugged into the ZCU106's DisplayPort socket — see
-[Showing the cameras on a DisplayPort monitor](docs/source/display.md). The same hardware
+[Showing the cameras on a DisplayPort monitor](https://mipi-over-chip2chip.camerafmc.com/en/latest/display.html). The same hardware
 also runs a **bare-metal** demo on the A53, without an operating system — see
-[Bare-metal demo](docs/source/baremetal.md).
+[Bare-metal demo](https://mipi-over-chip2chip.camerafmc.com/en/latest/baremetal.html).
 
 ## Requirements
 
@@ -186,7 +189,7 @@ starts with `TIMING:`.
 ```
 
 See [Yocto/README.md](Yocto/README.md) for the prerequisites and for the instructions to
-write the image to an SD card, and [docs/source/deploy.md](docs/source/deploy.md) for a
+write the image to an SD card, and [Deploying and updating the Linux image](https://mipi-over-chip2chip.camerafmc.com/en/latest/deploy.html) for a
 first deployment onto a board whose SD card you cannot reach.
 
 #### Build the bare-metal application of the host (Vivado + Vitis, Windows or Linux)
@@ -197,7 +200,7 @@ first deployment onto a board whose SD card you cannot reach.
 
 This builds the Vitis platform, the standalone BSP, the `cam_test` application and
 `Vitis/boot/zcu106/BOOT.BIN`. It needs no PetaLinux and no Linux build host. See
-[docs/source/baremetal.md](docs/source/baremetal.md).
+[Bare-metal demo](https://mipi-over-chip2chip.camerafmc.com/en/latest/baremetal.html).
 
 #### Build the configuration memory file of the mezzanine
 
@@ -207,7 +210,7 @@ This builds the Vitis platform, the standalone BSP, the `cam_test` application a
 
 This wraps the `auboard` bitstream into `Vivado/auboard/c2c_wrapper.mcs`, which
 `scripts/jtag/auboard_flash.tcl` writes into the board's configuration flash — see
-[docs/source/flash.md](docs/source/flash.md). The `auboard` target has no processor and no
+[Booting the AUBoard from its configuration flash](https://mipi-over-chip2chip.camerafmc.com/en/latest/flash.html). The `auboard` target has no processor and no
 software, so `./build.sh all --target auboard` builds the bitstream, this `.mcs`, and
 gathers both into `bootimages/mipi-over-chip2chip_auboard_bitstream-2025-2.zip`.
 
@@ -239,7 +242,7 @@ gathers both into `bootimages/mipi-over-chip2chip_auboard_bitstream-2025-2.zip`.
    Then power-cycle the board. `-cable` is a substring of the JTAG cable name; it keeps the
    script off the other boards on the same `hw_server`. Programming the flash destroys the
    image the board shipped with, so back it up first — see
-   [docs/source/flash.md](docs/source/flash.md) for that, for the Vivado Hardware Manager
+   [Booting the AUBoard from its configuration flash](https://mipi-over-chip2chip.camerafmc.com/en/latest/flash.html) for that, for the Vivado Hardware Manager
    GUI procedure, and for how to undo it.
 
    **The volatile alternative** is to program the FPGA over JTAG, which is what you want
@@ -272,7 +275,7 @@ gathers both into `bootimages/mipi-over-chip2chip_auboard_bitstream-2025-2.zip`.
    sudo c2c-cameras status       # service state : ready   /   health : OK
    v4l2-ctl -d /dev/video-cam0 --stream-mmap=4 --stream-count=60 --stream-to=/tmp/cam0.rgb
    ```
-   See [Using the cameras from Linux](docs/source/linux_cameras.md) — including the manual
+   See [Using the cameras from Linux](https://mipi-over-chip2chip.camerafmc.com/en/latest/linux_cameras.html) — including the manual
    overlay procedure, the stable device names and the retry
    (`systemctl restart c2c-cameras`).
 6. *Optional:* **put both cameras on a DisplayPort monitor** attached to the ZCU106. The
@@ -281,32 +284,33 @@ gathers both into `bootimages/mipi-over-chip2chip_auboard_bitstream-2025-2.zip`.
    sudo c2c-display check        # read-only: connector, EDID, planes, mixer registers
    sudo c2c-display              # both cameras, 960x540 each, side by side
    ```
-   See [Showing the cameras on a DisplayPort monitor](docs/source/display.md).
+   See [Showing the cameras on a DisplayPort monitor](https://mipi-over-chip2chip.camerafmc.com/en/latest/display.html).
 
 The ZCU106 can also be brought up over JTAG without any software at all
 (`scripts/jtag/zcu106_init.tcl` programs the PL and runs `psu_init`,
 `scripts/jtag/zcu106_mem.tcl` reads and writes the memory map); and the camera pipelines can
 be exercised from the AUBoard alone with `scripts/jtag/auboard_cam.tcl`. See the
-[build instructions](docs/source/build_instructions.md) for the full list of subcommands.
+[build instructions](https://mipi-over-chip2chip.camerafmc.com/en/latest/build_instructions.html) for the full list of subcommands.
 
 ## Documentation
 
-The full documentation is built with Sphinx from `docs/source/`:
+The full documentation is hosted at [mipi-over-chip2chip.camerafmc.com/en/latest](https://mipi-over-chip2chip.camerafmc.com/en/latest/)
+and is best viewed from there. It is built with Sphinx from the sources in `docs/source/`:
 
 | Page | Content |
 |------|---------|
-| [Description](docs/source/description.md) | the architecture of both block designs, the display path, address map, interrupts, clocks, measured performance |
-| [Requirements](docs/source/requirements.md) | tools and hardware |
-| [Supported boards](docs/source/supported_carriers.md) | the boards of each role |
-| [Build instructions](docs/source/build_instructions.md) | Vivado, Yocto, bare metal, and the JTAG bring-up scripts |
-| [Yocto](docs/source/yocto.md) | the AMD EDF flow of the host image |
-| [Deploying and updating the Linux image](docs/source/deploy.md) | SD card, first deployment without a card reader, updates |
-| [Booting the AUBoard from its configuration flash](docs/source/flash.md) | making the mezzanine design permanent: backup, `.mcs`, programming, timing, going back |
-| [Using the cameras from Linux](docs/source/linux_cameras.md) | the auto-start service, the health check, stable device names, formats, capture, picture quality, frame rates |
-| [Showing the cameras on a DisplayPort monitor](docs/source/display.md) | the display path, `c2c-display`, and how to prove the picture arrived without a monitor |
-| [Bare-metal demo](docs/source/baremetal.md) | the Vitis SDT flow with a User DTS, `cam_test`, running it over JTAG and dumping a frame |
-| [Advanced](docs/source/advanced.md) | changing the line rate, adding cameras, porting to another host board |
-| [Troubleshooting](docs/source/troubleshooting.md) | link, register access, image, display and build problems |
+| [Description](https://mipi-over-chip2chip.camerafmc.com/en/latest/description.html) | the architecture of both block designs, the display path, address map, interrupts, clocks, measured performance |
+| [Requirements](https://mipi-over-chip2chip.camerafmc.com/en/latest/requirements.html) | tools and hardware |
+| [Supported boards](https://mipi-over-chip2chip.camerafmc.com/en/latest/supported_carriers.html) | the boards of each role |
+| [Build instructions](https://mipi-over-chip2chip.camerafmc.com/en/latest/build_instructions.html) | Vivado, Yocto, bare metal, and the JTAG bring-up scripts |
+| [Yocto](https://mipi-over-chip2chip.camerafmc.com/en/latest/yocto.html) | the AMD EDF flow of the host image |
+| [Deploying and updating the Linux image](https://mipi-over-chip2chip.camerafmc.com/en/latest/deploy.html) | SD card, first deployment without a card reader, updates |
+| [Booting the AUBoard from its configuration flash](https://mipi-over-chip2chip.camerafmc.com/en/latest/flash.html) | making the mezzanine design permanent: backup, `.mcs`, programming, timing, going back |
+| [Using the cameras from Linux](https://mipi-over-chip2chip.camerafmc.com/en/latest/linux_cameras.html) | the auto-start service, the health check, stable device names, formats, capture, picture quality, frame rates |
+| [Showing the cameras on a DisplayPort monitor](https://mipi-over-chip2chip.camerafmc.com/en/latest/display.html) | the display path, `c2c-display`, and how to prove the picture arrived without a monitor |
+| [Bare-metal demo](https://mipi-over-chip2chip.camerafmc.com/en/latest/baremetal.html) | the Vitis SDT flow with a User DTS, `cam_test`, running it over JTAG and dumping a frame |
+| [Advanced](https://mipi-over-chip2chip.camerafmc.com/en/latest/advanced.html) | changing the line rate, adding cameras, porting to another host board |
+| [Troubleshooting](https://mipi-over-chip2chip.camerafmc.com/en/latest/troubleshooting.html) | link, register access, image, display and build problems |
 
 `docs/link_contract_deviations.md` is the authoritative record of every parameter that the
 two block designs must agree on, and of every place where one of them deviates.
